@@ -374,7 +374,7 @@ def offline():
             summary['app'] = str(app)
             if args.dmg:
                 for executable in (binary, app / 'Contents/MacOS' / info['CFBundleExecutable']):
-                    subprocess.run(['lipo', '-verify_arch', 'arm64', 'x86_64', str(executable)], check=True)
+                    subprocess.run(['lipo', str(executable), '-verify_arch', 'arm64', 'x86_64'], check=True)
                     for arch in ('arm64', 'x86_64'):
                         signature = subprocess.check_output(['codesign', '-dvvv', '--arch', arch,
                                     str(executable)], stderr=subprocess.STDOUT, text=True)

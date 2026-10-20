@@ -21,7 +21,7 @@ echo "Release evidence: $EVIDENCE"
 xcrun notarytool history --keychain-profile "$PROFILE" --output-format json > "$EVIDENCE/notary-access.json"
 ./script/package.sh --configuration release --universal --distribution --output "$OUTPUT"
 for BINARY in "$APP/Contents/MacOS/MSIScreenMenu" "$APP/Contents/MacOS/msi-screen"; do
-    lipo -verify_arch arm64 x86_64 "$BINARY"
+    lipo "$BINARY" -verify_arch arm64 x86_64
 done
 python3 scripts/verify.py --offline --binary "$APP/Contents/MacOS/msi-screen" --app "$APP" > "$EVIDENCE/app-smoke.log" 2>&1
 
