@@ -4,6 +4,12 @@ import IOKit.pwr_mgt
 import CoreGraphics
 import Darwin
 
+public enum HIDConnectionError: Error, LocalizedError, CustomStringConvertible {
+    case notPresent
+    public var description: String { "MSI USB controller is not connected to this Mac" }
+    public var errorDescription: String? { description }
+}
+
 public final class HIDConnection: ScreenTransport {
     public var onlineVideoCount: Int? {
         var displays = [CGDirectDisplayID](repeating: 0, count: 32)
@@ -23,8 +29,13 @@ public final class HIDConnection: ScreenTransport {
     private let lockFD: Int32
     private var displayAssertion: IOPMAssertionID = 0
     private var activityAssertion: IOPMAssertionID = 0
+    private let replyBudgetDeadline: TimeInterval?
 
-    public init() throws {
+    public init(replyBudget: TimeInterval? = nil) throws {
+        if let replyBudget, !replyBudget.isFinite || replyBudget <= 0 {
+            throw ScreenError.message("USB read deadline expired")
+        }
+        replyBudgetDeadline = replyBudget.map { ProcessInfo.processInfo.systemUptime + $0 }
         let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("msi-screen-control", isDirectory: true)
         try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
@@ -45,6 +56,7 @@ public final class HIDConnection: ScreenTransport {
         guard devices.count == 1, let found = devices.first else {
             IOHIDManagerClose(manager, 0)
             close(lockFD)
+            if devices.isEmpty { throw HIDConnectionError.notPresent }
             throw ScreenError.message("Expected one MSI USB controller; found \(devices.count). Connect the monitor's USB upstream cable to this Mac.")
         }
         device = found
@@ -64,7 +76,9 @@ public final class HIDConnection: ScreenTransport {
 
     deinit {
         IOHIDManagerUnscheduleFromRunLoop(manager, runLoop, CFRunLoopMode.defaultMode.rawValue)
-        IOHIDDeviceRegisterInputReportCallback(device, buffer, 64, nil, nil)
+        // IOKit keys callback registrations by context, including removal.
+        IOHIDDeviceRegisterInputReportCallback(device, buffer, 64, nil,
+                                              Unmanaged.passUnretained(self).toOpaque())
         IOHIDManagerClose(manager, 0)
         buffer.deallocate()
         close(lockFD)
@@ -76,8 +90,12 @@ public final class HIDConnection: ScreenTransport {
         try MSIProtocol.value(exchange(MSIProtocol.query(code)), for: code)
     }
 
-    public func writeLayout(_ state: ScreenState) throws {
-        let report = try MSIProtocol.layout(state)
+    public func writeSetting(_ setting: MonitorSetting, value: Int) throws {
+        try MSIProtocol.acknowledge(exchange(MSIProtocol.setting(setting, value: value)))
+    }
+
+    public func writeLayout(_ state: ScreenState, primaryChanged: Bool) throws {
+        let reports = try MSIProtocol.layoutReports(state, primaryChanged: primaryChanged)
         // Keep the Mac video path awake through a requested layout transition.
         // Hold these through the settle/readback interval, then release with
         // this connection; status, dry-run and unchanged requests never wake it.
@@ -90,28 +108,63 @@ public final class HIDConnection: ScreenTransport {
         let wake = IOPMAssertionDeclareUserActivity("Apply MSI display layout" as CFString,
                                                    kIOPMUserActiveLocal, &activityAssertion)
         guard wake == kIOReturnSuccess else { throw ScreenError.message("Cannot wake the display: \(wake)") }
-        try MSIProtocol.acknowledge(exchange(report))
+        for report in reports {
+            try MSIProtocol.acknowledge(exchange(report))
+        }
     }
 
-    private func exchange(_ bytes: [UInt8]) throws -> [UInt8] {
+    func writeKVM(_ route: KVMRoute) -> KVMWriteReceipt {
+        var attempted = false
+        do {
+            let packet = try MSIProtocol.kvm(route)
+            discardReplies()
+            attempted = true
+            let result = packet.withUnsafeBufferPointer {
+                IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, 1, $0.baseAddress!, packet.count)
+            }
+            guard result == kIOReturnSuccess else { throw ScreenError.message("USB report failed: \(result)") }
+            // Live bidirectional tests show KVM removes this interface before
+            // ACK delivery. Sending once, then reading the destination is both
+            // faster and stronger evidence than waiting on a disconnected host.
+            return KVMWriteReceipt(attempted: true, completed: true, acknowledged: false, error: nil)
+        } catch {
+            return KVMWriteReceipt(attempted: attempted, completed: false,
+                                   acknowledged: false, error: String(describing: error))
+        }
+    }
+
+    private func discardReplies() {
         // Drain earlier input before associating a new reply with this request.
         for _ in 0..<32 {
             if CFRunLoopRunInMode(.defaultMode, 0, true) != .handledSource { break }
         }
         reply = nil
         callbackError = nil
+    }
+
+    private func exchange(_ bytes: [UInt8]) throws -> [UInt8] {
+        discardReplies()
+        if let deadline = replyBudgetDeadline, ProcessInfo.processInfo.systemUptime >= deadline {
+            throw ScreenError.message("USB read deadline expired")
+        }
         let result = bytes.withUnsafeBufferPointer {
             IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, 1, $0.baseAddress!, bytes.count)
         }
         guard result == kIOReturnSuccess else {
             throw ScreenError.message("USB report failed: \(result)")
         }
-        let deadline = ProcessInfo.processInfo.systemUptime + 1
+        // A one-second reply deadline expired after input changes; a longer
+        // wait completed the same request without resending. Wait only as needed;
+        // ordinary replies still return immediately, without resending it.
+        let deadline = min(ProcessInfo.processInfo.systemUptime + 3, replyBudgetDeadline ?? .infinity)
         while reply == nil && callbackError == nil && ProcessInfo.processInfo.systemUptime < deadline {
             CFRunLoopRunInMode(.defaultMode, 0.01, true)
         }
         if let callbackError { throw ScreenError.message("USB input failed: \(callbackError)") }
-        guard let reply else { throw ScreenError.message("No HID reply within 1 second; read status before retrying a change") }
+        guard let reply else {
+            let command = String(decoding: bytes.dropFirst().prefix(7), as: UTF8.self)
+            throw ScreenError.message("No HID reply for \(command) within 3 seconds; read status before retrying a change")
+        }
         return reply
     }
 }

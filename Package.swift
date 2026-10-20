@@ -12,6 +12,7 @@ let package = Package(
         .target(name: "MSIScreenCore", linkerSettings: [.linkedFramework("IOKit")]),
         .executableTarget(name: "msi-screen", dependencies: ["MSIScreenCore"]),
         .executableTarget(name: "MSIScreenMenu", dependencies: ["MSIScreenCore"]),
-        .testTarget(name: "MSIScreenCoreTests", dependencies: ["MSIScreenCore"])
+        .testTarget(name: "MSIScreenCoreTests", dependencies: ["MSIScreenCore"]),
+        .testTarget(name: "MSIScreenMenuTests", dependencies: ["MSIScreenMenu"])
     ]
 )

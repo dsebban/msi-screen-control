@@ -57,7 +57,7 @@ jobs:
           retention-days: 7
 
   release:
-    name: Publish tagged release
+    name: Prepare release draft
     if: startsWith(github.ref, 'refs/tags/v')
     needs: verify
     runs-on: ubuntu-24.04
@@ -68,22 +68,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: package-*
-          path: release-assets
-          merge-multiple: true
-      - name: Publish tested archives and checksums
+      - name: Create draft after both architectures pass
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           test "$RELEASE_TAG" = "v$(cat VERSION)"
           test -f "docs/releases/$RELEASE_TAG.md"
-          cd release-assets
-          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 2
-          sha256sum ./*.zip > SHA256SUMS
-          gh release create "$RELEASE_TAG" ./*.zip SHA256SUMS \
+          # Signing credentials stay on the release Mac. CI packages remain
+          # workflow artifacts; only notarized assets are attached for publication.
+          gh release create "$RELEASE_TAG" --draft \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "MSI Screen $RELEASE_TAG" \
-            --notes-file "../docs/releases/$RELEASE_TAG.md"
+            --notes-file "docs/releases/$RELEASE_TAG.md"

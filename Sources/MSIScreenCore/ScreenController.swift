@@ -30,20 +30,53 @@ public struct Change: Codable, Equatable {
 
 public protocol ScreenTransport {
     func query(_ code: String) throws -> [UInt8]
-    func writeLayout(_ state: ScreenState) throws
+    func writeLayout(_ state: ScreenState, primaryChanged: Bool) throws
+    func writeSetting(_ setting: MonitorSetting, value: Int) throws
     var onlineVideoCount: Int? { get }
 }
 
 public final class ScreenController {
-    private let transport: ScreenTransport
+    public static let didChangeNotification = Notification.Name("com.danielsivan.msi-screen.monitor-changed")
+    let transport: ScreenTransport
+    private var changed = false
     public init(transport: ScreenTransport) { self.transport = transport }
 
-    public func state() throws -> ScreenState {
+    /// Each operation owns its HID session on the calling thread. Announce a
+    /// verified change only after that session has released the process lock,
+    /// so another client can immediately read the committed state.
+    public static func withHIDConnection<T>(announceChange: Bool = true,
+                                            _ operation: (ScreenController) throws -> T) throws -> T {
+        let (result, changed) = try runHIDOperation(operation)
+        if changed && announceChange {
+            postChangeNotification()
+        }
+        return result
+    }
+
+    static func postChangeNotification() {
+        DistributedNotificationCenter.default().postNotificationName(
+            didChangeNotification, object: String(ProcessInfo.processInfo.processIdentifier),
+            userInfo: nil, deliverImmediately: true)
+    }
+
+    private static func runHIDOperation<T>(_ operation: (ScreenController) throws -> T) throws -> (T, Bool) {
+        let controller = ScreenController(transport: try HIDConnection())
+        let result = try operation(controller)
+        return (result, controller.changed)
+    }
+
+    func didVerifyChange() { changed = true }
+
+    func validateIdentity() throws {
         let identity = try transport.query("00140")
         let version = try transport.query("00150")
         guard identity == [0x30, 0x30, 0xa0], version == Array("V20".utf8) else {
             throw ScreenError.message("Unrecognized MSI model/protocol (\(identity.hex), \(version.hex)); no settings changed")
         }
+    }
+
+    public func state() throws -> ScreenState {
+        try validateIdentity()
         // MD342CQP uses the primary input for source 1, and 00610 for the
         // secondary PBP source. 00670/00680 belong to older four-source models.
         return try ScreenState(model: "MD342CQP", protocolVersion: "V20",
@@ -97,31 +130,38 @@ public final class ScreenController {
         return target
     }
 
-    public func apply(_ target: ScreenState, from before: ScreenState) throws -> ScreenState {
+    public func apply(_ target: ScreenState, from before: ScreenState,
+                      beforeWrite: () throws -> Void = {}) throws -> ScreenState {
         guard try state() == before else { throw ScreenError.message("Monitor changed since planning; read status again") }
+        // A no-op still validates the baseline but needs no video enumeration
+        // or redundant second USB snapshot.
+        guard target != before else { return before }
         let videoCountBefore = transport.onlineVideoCount
-        if target != before {
-            try transport.writeLayout(target)
-            // MSI's MD342CQP profile builder waits 5000 ms after the complete
-            // PIPSpecial packet. Short writes can echo transient, unapplied values.
-            Thread.sleep(forTimeInterval: 5)
-        }
+        // Multi-stage operations can cancel or recheck their configuration
+        // after the full stale-state read, at the actual mutation boundary.
+        try beforeWrite()
+        try transport.writeLayout(target, primaryChanged: target.source1 != before.source1)
+        // MSI's MD342CQP profile builder waits 5000 ms after the complete
+        // PIPSpecial packet. Short writes can echo transient, unapplied values.
+        Thread.sleep(forTimeInterval: 5)
         var after = try state()
         var initializedLayout = after
         initializedLayout.mode = target.mode
         // Cold USB-C initialization was reproduced on this unit: its video
         // device appears, sources apply, but PBP returns to off. Complete that
         // specific transition once. Never retry USB errors or other mismatches.
-        if target != before, target.mode == .pbp, after.mode == .off,
+        if target.mode == .pbp, after.mode == .off,
            target.source1 == .usbc || target.source2 == .usbc,
            videoCountBefore == 0, transport.onlineVideoCount == 1, initializedLayout == target {
-            try transport.writeLayout(target)
+            try beforeWrite()
+            try transport.writeLayout(target, primaryChanged: target.source1 != after.source1)
             Thread.sleep(forTimeInterval: 5)
             after = try state()
         }
         guard after == target else {
             throw ScreenError.message("Layout did not persist after settling; read status before retrying. Observed mode=\(after.mode.rawValue), source1=\(after.source1.rawValue), source2=\(after.source2.rawValue)")
         }
+        didVerifyChange()
         return after
     }
 }

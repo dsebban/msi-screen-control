@@ -1,0 +1,7 @@
+# MSI MD342CQP USB control and optional Bolt vendor-interface diagnostics.
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="1462", ATTRS{idProduct}=="3fa4", GROUP="plugdev", MODE="0660"
+
+# Optional Bolt inventory/ping access, restricted to its vendor USB interface 02.
+# Vendor/product and interface attributes live on different USB ancestors.
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c548", ENV{.MSI_SCREEN_BOLT}="1"
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ENV{.MSI_SCREEN_BOLT}=="1", ATTRS{bInterfaceNumber}=="02", GROUP="plugdev", MODE="0660"

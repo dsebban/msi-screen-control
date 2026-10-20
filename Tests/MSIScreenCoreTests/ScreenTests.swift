@@ -36,6 +36,24 @@ final class ScreenTests: XCTestCase {
         XCTAssertThrowsError(try ScreenController.pbpTarget(from: initial, enabled: true, left: .dp, right: .dp))
     }
 
+    func testFullscreenSendsPrimarySelectionAfterCompleteLayout() throws {
+        // Reproduced on MD342CQP: off+DP in the complete packet exits PBP but
+        // leaves HDMI1 selected. Vendor register 00500 must follow that packet.
+        let reports = try MSIProtocol.layoutReports(initial, primaryChanged: true)
+        guard reports.count == 2 else {
+            return XCTFail("Full screen must send the layout and explicit primary input")
+        }
+        XCTAssertEqual(Array(reports[0].prefix(7)), [1] + Array("5b001g".utf8))
+        let primary = [UInt8(1)] + Array("5b00500002\r".utf8)
+        XCTAssertEqual(reports[1], primary + Array(repeating: 0, count: 64 - primary.count))
+        var split = initial
+        split.mode = .pbp
+        XCTAssertEqual(try MSIProtocol.layoutReports(initial, primaryChanged: false).count, 1,
+                       "Exiting split on the same primary must not reselect that input")
+        XCTAssertEqual(try MSIProtocol.layoutReports(split, primaryChanged: true).count, 1,
+                       "PBP continues to use only its complete layout packet")
+    }
+
     func testFullscreenLeavesSplitModeWithoutChangingSavedSecondaryOrPIPGeometry() throws {
         let split = try ScreenController.pbpTarget(from: initial, enabled: true, left: .dp, right: .usbc)
         let full = ScreenController.fullscreenTarget(from: split, input: .usbc)
@@ -55,7 +73,10 @@ final class ScreenTests: XCTestCase {
         var onlineVideoCount: Int? = 1
         var coldUSBVideo = false
         func query(_ code: String) throws -> [UInt8] { values[code]! }
-        func writeLayout(_ state: ScreenState) throws {
+        func writeSetting(_ setting: MonitorSetting, value: Int) throws {
+            XCTFail("Layout operations must not write individual settings")
+        }
+        func writeLayout(_ state: ScreenState, primaryChanged: Bool) throws {
             writes += 1
             if coldUSBVideo && writes == 1 {
                 onlineVideoCount = 1
