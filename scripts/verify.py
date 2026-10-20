@@ -367,7 +367,10 @@ def offline():
                 assert executable.is_file() and os.access(executable, os.X_OK)
                 # The release must not depend on Homebrew or a developer checkout.
                 dependencies = subprocess.check_output(['/usr/bin/otool', '-L', str(executable)], text=True)
-                for line in dependencies.splitlines()[1:]:
+                for line in dependencies.splitlines():
+                    # Fat binaries emit a separate file header for each slice.
+                    if line.startswith(str(executable)) and line.endswith(':'):
+                        continue
                     library = line.strip().split(' (', 1)[0]
                     assert library.startswith(('/System/Library/', '/usr/lib/', '@rpath/libswift')), library
             subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)], check=True)
