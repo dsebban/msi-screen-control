@@ -47,7 +47,7 @@ public struct GameControllerProbeResult: Codable, Equatable {
 public enum GameControllerClient {
     private static var probing = false
 
-    static func isController(name: String, usagePage: Int, usage: Int) -> Bool {
+    nonisolated static func isController(name: String, usagePage: Int, usage: Int) -> Bool {
         name == "BSP-D8" || (usagePage == 1 && (usage == 4 || usage == 5))
     }
 

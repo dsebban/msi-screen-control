@@ -13,7 +13,7 @@ public enum MacLaptopPosition: String, CaseIterable, Codable {
     case left, right
 }
 
-public struct MacDisplayMode: Codable, Equatable {
+public struct MacDisplayMode: Codable, Equatable, Sendable {
     public let id: Int32
     public let width: Int
     public let height: Int
@@ -23,7 +23,7 @@ public struct MacDisplayMode: Codable, Equatable {
     public let flags: UInt32
 }
 
-public struct MacDisplayInfo: Codable, Equatable {
+public struct MacDisplayInfo: Codable, Equatable, Sendable {
     public let id: UInt32
     public let uuid: String
     public let vendor: UInt32
@@ -84,28 +84,9 @@ public final class MacDisplayController {
         guard let consoleUser, !consoleUser.isEmpty, consoleUser != "loginwindow", consoleUID == getuid() else {
             throw ScreenError.message("Run display controls as the Mac's currently signed-in desktop user")
         }
-        let ids = try onlineDisplays()
-        let displays = try ids.map { id -> MacDisplayInfo in
-            let reference: Unmanaged<CFUUID>? = CGDisplayCreateUUIDFromDisplayID(id)
-            guard let reference else {
-                throw ScreenError.message("Display identity is unavailable; refresh before changing the main display")
-            }
-            let uuid = reference.takeRetainedValue()
-            let mode = CGDisplayCopyDisplayMode(id).map {
-                MacDisplayMode(id: $0.ioDisplayModeID, width: $0.width, height: $0.height,
-                               pixelWidth: $0.pixelWidth, pixelHeight: $0.pixelHeight,
-                               refreshRate: $0.refreshRate, flags: $0.ioFlags)
-            }
-            return MacDisplayInfo(
-                id: id, uuid: CFUUIDCreateString(nil, uuid) as String,
-                vendor: CGDisplayVendorNumber(id), model: CGDisplayModelNumber(id),
-                isBuiltIn: CGDisplayIsBuiltin(id) != 0, isMain: CGDisplayIsMain(id) != 0,
-                isActive: CGDisplayIsActive(id) != 0, isAsleep: CGDisplayIsAsleep(id) != 0,
-                isMirrored: CGDisplayIsInMirrorSet(id) != 0,
-                mirrorsDisplay: CGDisplayMirrorsDisplay(id), bounds: CGDisplayBounds(id),
-                rotation: CGDisplayRotation(id), mode: mode)
-        }
-        guard try onlineDisplays() == ids else {
+        let ids = try Self.onlineDisplays()
+        let displays = try ids.map { try Self.displayInfo($0, requireUUID: true) }
+        guard try Self.onlineDisplays() == ids else {
             throw ScreenError.message("Displays changed while reading; refresh before changing the main display")
         }
         let name = SCDynamicStoreCopyComputerName(nil, nil) as String?
@@ -231,7 +212,43 @@ public final class MacDisplayController {
         return Int32(value)
     }
 
-    private func onlineDisplays() throws -> [CGDirectDisplayID] {
+    /// Public Quartz facts are usable from SSH/non-console clients when macOS
+    /// exposes them. This does not inherit the mutator's console-user gate.
+    static func passiveDisplays() throws -> InventorySourceSlice<MacDisplayInfo> {
+        let ids = try onlineDisplays()
+        let displays = try ids.map { try displayInfo($0, requireUUID: false) }
+        guard try onlineDisplays() == ids else {
+            return InventorySourceSlice(displays, outcome: .failed(code: .changedDuringEnumeration, message: "Displays changed during enumeration"))
+        }
+        if displays.isEmpty {
+            var uid: uid_t = 0, gid: gid_t = 0
+            let user = SCDynamicStoreCopyConsoleUser(nil, &uid, &gid) as String?
+            if user == nil || user == "loginwindow" || uid != getuid() {
+                return InventorySourceSlice([], outcome: .failed(code: .nonConsoleSession, message: "Display facts unavailable in this session"))
+            }
+        }
+        return InventorySourceSlice(displays)
+    }
+
+    private static func displayInfo(_ id: CGDirectDisplayID, requireUUID: Bool) throws -> MacDisplayInfo {
+        let reference: Unmanaged<CFUUID>? = CGDisplayCreateUUIDFromDisplayID(id)
+        if requireUUID && reference == nil {
+            throw ScreenError.message("Display identity is unavailable; refresh before changing the main display")
+        }
+        let uuid = reference.map { CFUUIDCreateString(nil, $0.takeRetainedValue()) as String }
+        let mode = CGDisplayCopyDisplayMode(id).map {
+            MacDisplayMode(id: $0.ioDisplayModeID, width: $0.width, height: $0.height,
+                           pixelWidth: $0.pixelWidth, pixelHeight: $0.pixelHeight,
+                           refreshRate: $0.refreshRate, flags: $0.ioFlags)
+        }
+        return MacDisplayInfo(id: id, uuid: uuid ?? "", vendor: CGDisplayVendorNumber(id), model: CGDisplayModelNumber(id),
+            isBuiltIn: CGDisplayIsBuiltin(id) != 0, isMain: CGDisplayIsMain(id) != 0,
+            isActive: CGDisplayIsActive(id) != 0, isAsleep: CGDisplayIsAsleep(id) != 0,
+            isMirrored: CGDisplayIsInMirrorSet(id) != 0, mirrorsDisplay: CGDisplayMirrorsDisplay(id),
+            bounds: CGDisplayBounds(id), rotation: CGDisplayRotation(id), mode: mode)
+    }
+
+    private static func onlineDisplays() throws -> [CGDirectDisplayID] {
         var count: UInt32 = 0
         try Self.check(CGGetOnlineDisplayList(0, nil, &count), action: "Count displays")
         guard count > 0 else { return [] }

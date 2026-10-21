@@ -24,6 +24,7 @@ for BINARY in "$APP/Contents/MacOS/MSIScreenMenu" "$APP/Contents/MacOS/msi-scree
     lipo "$BINARY" -verify_arch arm64 x86_64
 done
 python3 scripts/verify.py --offline --binary "$APP/Contents/MacOS/msi-screen" --app "$APP" > "$EVIDENCE/app-smoke.log" 2>&1
+./script/generate-appcast.sh --check-key
 
 notarize() {
     local artifact="$1" receipt="$2"
@@ -73,9 +74,10 @@ notarize "$DMG" "$EVIDENCE/notary-dmg.json"
 xcrun stapler staple "$DMG"
 xcrun stapler validate "$DMG"
 python3 scripts/verify.py --offline --dmg "$DMG" > "$EVIDENCE/dmg-smoke.log" 2>&1
+./script/generate-appcast.sh "$OUTPUT"
 (
     cd "$OUTPUT"
-    shasum -a 256 "$(basename "$DMG")" "$(basename "$ZIP")" > SHA256SUMS
+    shasum -a 256 "$(basename "$DMG")" "$(basename "$ZIP")" appcast.xml > SHA256SUMS
     shasum -a 256 -c SHA256SUMS
 )
 echo "Signed, notarized release ready: $DMG"

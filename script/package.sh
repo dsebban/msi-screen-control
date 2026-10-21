@@ -82,9 +82,15 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/MSIScreenMenu" "$APP/Contents/MacOS/MSIScreenMenu"
 cp "$BIN_DIR/msi-screen" "$APP/Contents/MacOS/msi-screen"
 cp "$ROOT_DIR/LICENSE" "$APP/Contents/Resources/LICENSE"
-python3 - "$APP/Contents/Info.plist" "$ROOT_DIR/VERSION" <<'PY'
-import pathlib, plistlib, re, sys
+/usr/bin/ditto "$ROOT_DIR/skills/msi-screen-control" "$APP/Contents/Resources/AgentSkills/msi-screen-control"
+mkdir -p "$APP/Contents/Frameworks"
+SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
+/usr/bin/ditto "$BIN_DIR/Sparkle.framework" "$SPARKLE"
+cp "$ROOT_DIR/.build/artifacts/sparkle/Sparkle/LICENSE" "$APP/Contents/Resources/Sparkle-LICENSE"
+python3 - "$APP/Contents/Info.plist" "$ROOT_DIR/VERSION" "$ROOT_DIR/config/updates.json" "$CONFIGURATION" <<'PY'
+import json, pathlib, plistlib, re, sys
 version = pathlib.Path(sys.argv[2]).read_text().strip()
+updates = json.loads(pathlib.Path(sys.argv[3]).read_text())
 if not re.fullmatch(r'\d+\.\d+\.\d+', version):
     raise SystemExit('VERSION must contain MAJOR.MINOR.PATCH')
 with open(sys.argv[1], 'wb') as f:
@@ -99,6 +105,12 @@ with open(sys.argv[1], 'wb') as f:
         'LSMinimumSystemVersion': '13.0',
         'LSUIElement': True,
         'NSPrincipalClass': 'NSApplication',
+        'SUFeedURL': updates['feedURL'],
+        'SUPublicEDKey': updates['publicKey'],
+        'SURequireSignedFeed': True,
+        'SUVerifyUpdateBeforeExtraction': True,
+        'SUEnableAutomaticChecks': sys.argv[4] == 'release',
+        'SUAutomaticallyUpdate': True,
         'CFBundleURLTypes': [{'CFBundleURLName': 'MSI Screen controls', 'CFBundleURLSchemes': ['msi-screen']}],
     }, f)
 PY
@@ -108,6 +120,14 @@ PY
 # release-dmg.sh owns notarization. Local development needs neither service.
 SIGN_ARGS=(--force --timestamp=none --sign "$SIGNING_IDENTITY")
 if $DISTRIBUTION; then SIGN_ARGS=(--force --timestamp --options runtime --sign "$SIGNING_IDENTITY"); fi
+# Sign nested Sparkle services inside-out with the same identity as the app.
+for COMPONENT in "$SPARKLE/Versions/B/XPCServices/Downloader.xpc" \
+                 "$SPARKLE/Versions/B/XPCServices/Installer.xpc" \
+                 "$SPARKLE/Versions/B/Autoupdate" \
+                 "$SPARKLE/Versions/B/Updater.app" "$SPARKLE"; do
+    [[ -e "$COMPONENT" ]] || { echo "Missing Sparkle component: $COMPONENT" >&2; exit 1; }
+    /usr/bin/codesign "${SIGN_ARGS[@]}" "$COMPONENT"
+done
 /usr/bin/codesign "${SIGN_ARGS[@]}" \
     --identifier com.danielsivan.msi-screen.cli "$APP/Contents/MacOS/msi-screen"
 /usr/bin/codesign "${SIGN_ARGS[@]}" "$APP"

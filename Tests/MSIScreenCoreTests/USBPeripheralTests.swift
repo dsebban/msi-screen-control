@@ -1,8 +1,101 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import MSIScreenCore
 
 final class USBPeripheralTests: XCTestCase {
+    private func rawGraph(_ devices: [PeripheralUSBDevice]) throws -> USBDeviceGraph {
+        try USBDeviceGraph(devices: devices.map { USBDeviceNode(id: $0.id, parentID: $0.parentID, vendor: $0.vendor, product: $0.product,
+            deviceClass: $0.deviceClass, rootHub: $0.rootHub, name: nil, serial: nil) })
+    }
+    func testOrderedDomainAncestryAndLegacyLeasesReleasePartialAcquisition() throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/msi-u2-leases-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let request = DeviceResourceLock.Request(domains: ["usb:3", "usb:1", "usb:3"], controller: true, rapoo: true)
+        XCTAssertEqual(request.domains, ["usb:1", "usb:3"])
+        XCTAssertEqual(Array(request.orderedNames.suffix(2)), ["controller.lock", "rapoo.lock"])
+        var legacy: RapooQueryLock? = try RapooQueryLock(directory: directory)
+        XCTAssertThrowsError(try DeviceResourceLock(request, directory: directory))
+        // A failed last acquisition must release the earlier new and controller leases.
+        var partial: DeviceResourceLock? = try DeviceResourceLock(.init(domains: request.domains, controller: true), directory: directory)
+        for fd in partial!.descriptors { XCTAssertNotEqual(fcntl(fd, F_GETFD) & FD_CLOEXEC, 0) }
+        partial = nil; legacy = nil
+        let owner = try DeviceResourceLock(request, directory: directory)
+        let borrowed = try RapooQueryLock(borrowing: owner)
+        borrowed.release()
+        XCTAssertThrowsError(try RapooQueryLock(directory: directory))
+        XCTAssertNotNil(owner.descriptor(forLegacy: "controller.lock"))
+        withExtendedLifetime((owner, legacy)) {}
+    }
+    func testMonitorAndReceiverOwnersShareAncestryAndBothCompatibilityLocks() throws {
+        let devices = [
+            PeripheralUSBDevice(id: 1, parentID: 2, vendor: 0x1462, product: 0x3fa4, deviceClass: 0, rootHub: false),
+            PeripheralUSBDevice(id: 2, parentID: 3, vendor: 1, product: 2, deviceClass: 9, rootHub: false),
+            PeripheralUSBDevice(id: 3, parentID: nil, vendor: 1, product: 3, deviceClass: 9, rootHub: true),
+            PeripheralUSBDevice(id: 4, parentID: 2, vendor: 0x24ae, product: 0x186a, deviceClass: 0, rootHub: false),
+            PeripheralUSBDevice(id: 5, parentID: 2, vendor: 0x046d, product: 0xc548, deviceClass: 0, rootHub: false)]
+        let graph = try rawGraph(devices)
+        let monitor = try HIDConnection.builtInSelection(from: InventorySourceSlice(graph.devices)).request
+        let rapoo = try DeviceResourceLock.request(usbID: 4, graph: graph)
+        let bolt = try DeviceResourceLock.request(usbID: 5, graph: graph)
+        XCTAssertTrue(monitor.controller && monitor.rapoo && rapoo.controller && rapoo.rapoo && bolt.controller)
+        XCTAssertFalse(bolt.rapoo) // Bolt has no invented legacy lease.
+        XCTAssertFalse(Set(monitor.domains).intersection(rapoo.domains).isEmpty)
+        XCTAssertFalse(Set(monitor.domains).intersection(bolt.domains).isEmpty)
+        let directory = URL(fileURLWithPath: "/private/tmp/msi-u2-topology-locks-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let owner = try DeviceResourceLock(monitor, directory: directory)
+        XCTAssertThrowsError(try DeviceResourceLock(rapoo, directory: directory))
+        XCTAssertThrowsError(try DeviceResourceLock(bolt, directory: directory))
+        let rawLegacy = open(directory.appendingPathComponent("controller.lock").path, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+        defer { close(rawLegacy) }
+        XCTAssertEqual(flock(rawLegacy, LOCK_EX | LOCK_NB), -1)
+        withExtendedLifetime(owner) {}
+    }
+
+    func testGenericHubSubtreeTakesRapooCompatibilityLease() throws {
+        let devices = [
+            PeripheralUSBDevice(id: 1, parentID: nil, vendor: 1, product: 1, deviceClass: 9, rootHub: true),
+            PeripheralUSBDevice(id: 2, parentID: 1, vendor: 2, product: 2, deviceClass: 9, rootHub: false),
+            PeripheralUSBDevice(id: 3, parentID: 2, vendor: 3, product: 3, deviceClass: 9, rootHub: false),
+            PeripheralUSBDevice(id: 4, parentID: 3, vendor: 0x24ae, product: 0x186a, deviceClass: 0, rootHub: false),
+            PeripheralUSBDevice(id: 5, parentID: 1, vendor: 5, product: 5, deviceClass: 9, rootHub: false)]
+        let graph = try rawGraph(devices)
+        let hub = try DeviceResourceLock.request(usbID: 2, graph: graph, affectsHub: true)
+        let unrelated = try DeviceResourceLock.request(usbID: 5, graph: graph, affectsHub: true)
+        let selectedHub = try DeviceEndpoint(kind: .usb, id: String(repeating: "a", count: 64),
+            identity: DevicePassiveIdentity(transport: .usb, vendorID: 2, productID: 2), physicalDomainID: String(repeating: "b", count: 64),
+            incarnationID: String(repeating: "c", count: 64), address: .usb(registryID: 2, parentID: 1))
+        XCTAssertEqual(try DeviceResourceLock.selectedRequest(selectedHub, graph: graph), hub)
+        XCTAssertTrue(hub.rapoo)
+        XCTAssertFalse(hub.controller)
+        XCTAssertFalse(unrelated.rapoo)
+        XCTAssertEqual(hub.orderedNames.last, "rapoo.lock")
+        let directory = URL(fileURLWithPath: "/private/tmp/msi-u2-generic-hub-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let lease = try DeviceResourceLock(hub, directory: directory)
+        XCTAssertThrowsError(try RapooQueryLock(directory: directory))
+        withExtendedLifetime(lease) {}
+    }
+    func testIncompleteUSBSourceCannotAuthorizeBuiltInAbsence() throws {
+        let controller = USBDeviceNode(id: 10, parentID: nil, vendor: 0x1462, product: 0x3fa4,
+            deviceClass: 0, rootHub: false, name: nil, serial: nil)
+        for values in [[], [controller]] {
+            let source = InventorySourceSlice(values, outcome: .failed(code: .identityUnavailable, message: "Fixture source incomplete"))
+            XCTAssertThrowsError(try HIDConnection.builtInSelection(from: source)) {
+                XCTAssertFalse($0 is HIDConnectionError)
+                XCTAssertEqual($0 as? DeviceContractError, .invalid("usbInventoryIncomplete"))
+            }
+        }
+        let unidentified = USBDeviceNode(id: 20, parentID: nil, vendor: nil, product: nil,
+            deviceClass: 0, rootHub: false, name: nil, serial: nil)
+        XCTAssertThrowsError(try HIDConnection.builtInSelection(from: InventorySourceSlice([unidentified]))) {
+            XCTAssertEqual($0 as? DeviceContractError, .invalid("usbIdentityUnavailable"))
+        }
+        XCTAssertThrowsError(try HIDConnection.builtInSelection(from: InventorySourceSlice<USBDeviceNode>([]))) {
+            XCTAssertTrue($0 is HIDConnectionError)
+        }
+    }
     func testMetadataAcceptsOnlyRequestedReceiverRegisterAndOmitsPrivateFields() throws {
         var pairing: [UInt8] = [0x11, 0xff, 0x83, 0xb5, 0x51, 1, 0x85, 0xb3] + Array(repeating: 0xaa, count: 12)
         XCTAssertEqual(try BoltPeripheralProtocol.decode(pairing, for: .pairing(1)),
@@ -73,6 +166,22 @@ final class USBPeripheralTests: XCTestCase {
         XCTAssertEqual(calls, 1)
         XCTAssertTrue(result.devices.isEmpty)
         XCTAssertNotNil(result.error)
+    }
+
+    func testSharedGraphProjectionRetainsSpecializedTopologyAndSingletonGuard() throws {
+        let nodes = [
+            USBDeviceNode(id: 1, parentID: nil, vendor: 1, product: 1, deviceClass: 9, rootHub: true, name: nil, serial: nil),
+            USBDeviceNode(id: 2, parentID: 1, vendor: 1, product: 2, deviceClass: 9, rootHub: false, name: nil, serial: nil),
+            USBDeviceNode(id: 3, parentID: 2, vendor: 0x1462, product: 0x3fa4, deviceClass: 0, rootHub: false, name: nil, serial: nil),
+            USBDeviceNode(id: 4, parentID: 2, vendor: 0x046d, product: 0xc548, deviceClass: 0, rootHub: false, name: nil, serial: nil),
+            USBDeviceNode(id: 5, parentID: 1, vendor: 0x24ae, product: 0x186a, deviceClass: 0, rootHub: false, name: nil, serial: nil)
+        ]
+        let topology = try MonitorUSBTopology(devices: nodes.compactMap(\.peripheralProjection))
+        XCTAssertEqual(topology.monitorHubID, 2)
+        XCTAssertEqual(topology.connection(.bolt), .monitorHub)
+        XCTAssertEqual(topology.connection(.rapoo), .elsewhere)
+        let another = USBDeviceNode(id: 6, parentID: 2, vendor: 0x1462, product: 0x3fa4, deviceClass: 0, rootHub: false, name: nil, serial: nil)
+        XCTAssertThrowsError(try MonitorUSBTopology(devices: (nodes + [another]).compactMap(\.peripheralProjection)))
     }
 
     func testTopologyIncludesNestedMonitorHubsButNotSharedHostRoot() throws {

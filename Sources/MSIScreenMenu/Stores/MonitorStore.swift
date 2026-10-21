@@ -746,8 +746,7 @@ final class MonitorStore: ObservableObject {
                     self.receive(settings.layout)
                     self.message = "Settings read back from monitor."
                 case .failure(let error):
-                    self.settings = nil
-                    self.settingsDraft = [:]
+                    self.invalidateLocalMonitor()
                     self.error = String(describing: error)
                     self.message = "Refresh controls before trying again."
                 }
@@ -788,7 +787,7 @@ final class MonitorStore: ObservableObject {
                     self.settingsDraft = [:]
                     self.message = state.mode == .pip ? "PIP active · choose a layout to replace it." : "Read back from monitor"
                 case .failure(let error):
-                    self.state = nil
+                    self.invalidateLocalMonitor()
                     self.error = String(describing: error)
                     self.message = "Refresh before trying again."
                 }

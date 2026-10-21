@@ -523,24 +523,18 @@ enum RapooTopButtonMutation {
     }
 }
 
-/// Coordinates this app and CLI without acquiring the monitor's separate lock.
+/// Compatibility lease for older Rapoo clients. Live sessions borrow the
+/// coordinator's ordered set instead of independently flocking rapoo.lock.
 final class RapooQueryLock {
-    private var descriptor: Int32 = -1
+    private var lease: DeviceResourceLock?
     init(directory: URL? = nil) throws {
-        let cache = directory ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("msi-screen-control", isDirectory: true)
-        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
-        descriptor = open(cache.appendingPathComponent("rapoo.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard descriptor >= 0 else { throw ScreenError.message("Cannot open the Rapoo query lock") }
-        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-            release()
-            throw ScreenError.message("Another MSI Screen process is using the Rapoo receiver")
-        }
+        lease = try DeviceResourceLock(.init(domains: [], rapoo: true), directory: directory)
     }
-    func release() {
-        if descriptor >= 0 { close(descriptor); descriptor = -1 }
+    init(borrowing lease: DeviceResourceLock) throws {
+        guard lease.descriptor(forLegacy: "rapoo.lock") != nil else { throw DeviceContractError.invalid("missingBorrowedLease") }
+        self.lease = lease
     }
-    deinit { release() }
+    func release() { lease = nil }
 }
 
 private enum MacRapooReader {
@@ -641,9 +635,17 @@ private enum MacRapooReader {
         try cancellation.check()
         try requireNoAHub()
         let deadline = ProcessInfo.processInfo.systemUptime + 5
-        let lock = try RapooQueryLock()
-        defer { lock.release() }
         let expected = try target()
+        let graph = try MacUSBPeripheralReader.controlGraph(from: USBDeviceGraph.enumerateUSB())
+        let request = try DeviceResourceLock.request(usbID: expected.receiver, graph: graph)
+        let lease = try DeviceResourceLock(request)
+        let lock = try RapooQueryLock(borrowing: lease)
+        defer { lock.release(); withExtendedLifetime(lease) {} }
+        let currentGraph = try MacUSBPeripheralReader.controlGraph(from: USBDeviceGraph.enumerateUSB())
+        guard try target() == expected,
+              try DeviceResourceLock.request(usbID: expected.receiver, graph: currentGraph) == request else {
+            throw DeviceContractError.invalid("staleEndpoint")
+        }
         let device = try selectDevice(usbID: expected.receiver)
         let opened = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
         if opened == kIOReturnNotPermitted {

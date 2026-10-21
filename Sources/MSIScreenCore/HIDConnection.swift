@@ -20,46 +20,137 @@ public final class HIDConnection: ScreenTransport {
         }
         return matching.count
     }
-    private let manager: IOHIDManager
+    private let manager: IOHIDManager?
     private let device: IOHIDDevice
     private let runLoop = CFRunLoopGetCurrent()!
     private let buffer: UnsafeMutablePointer<UInt8>
     private var reply: [UInt8]?
     private var callbackError: IOReturn?
-    private let lockFD: Int32
+    private let resourceLease: DeviceResourceLock
     private var displayAssertion: IOPMAssertionID = 0
     private var activityAssertion: IOPMAssertionID = 0
     private let replyBudgetDeadline: TimeInterval?
 
-    public init(replyBudget: TimeInterval? = nil) throws {
+    public convenience init(replyBudget: TimeInterval? = nil) throws {
+        let selection = try Self.builtInSelection(from: USBDeviceGraph.enumerateUSB())
+        let lease = try DeviceResourceLock(selection.request)
+        try self.init(replyBudget: replyBudget, selectedEndpoint: nil, borrowedLease: lease, expectedUSBID: selection.usbID)
+    }
+
+    static func builtInSelection(from source: InventorySourceSlice<USBDeviceNode>) throws -> (usbID: UInt64, request: DeviceResourceLock.Request) {
+        let graph = try MacUSBPeripheralReader.controlGraph(from: source)
+        // Unknown USB identities cannot prove genuine MSI absence and authorize
+        // KVM remote fallback. Inventory may still display these partial facts.
+        guard graph.devices.allSatisfy({ $0.vendor != nil && $0.product != nil }) else { throw DeviceContractError.invalid("usbIdentityUnavailable") }
+        let controllers = graph.devices.filter { $0.vendor == 0x1462 && $0.product == 0x3fa4 }
+        guard controllers.count == 1, let controller = controllers.first else {
+            if controllers.isEmpty { throw HIDConnectionError.notPresent }
+            throw ScreenError.message("More than one MSI USB controller is present")
+        }
+        return (controller.id, try DeviceResourceLock.request(usbID: controller.id, graph: graph, affectsHub: true))
+    }
+
+    /// Passive selection, shared with fixtures. Registry identity, not VID/PID
+    /// order, chooses an interface; a USB-only selection must still be unique.
+    static func selectedInterface(for endpoint: DeviceEndpoint, from source: InventorySourceSlice<HIDDeviceNode>) throws -> HIDDeviceNode {
+        guard case .complete = source.outcome else { throw DeviceContractError.invalid("hidInventoryIncomplete") }
+        let candidates: [HIDDeviceNode]
+        switch endpoint.address {
+        case .hid(let id, _, _): candidates = source.values.filter { $0.id == id }
+        case .usb(let id, _): candidates = source.values.filter {
+            $0.usbDeviceID == id && $0.vendor == 0x1462 && $0.product == 0x3fa4
+        }
+        default: throw DeviceContractError.invalid("selectedMSIEndpoint")
+        }
+        guard candidates.count == 1, let selected = candidates.first else {
+            throw DeviceContractError.invalid(candidates.isEmpty ? "absentEndpoint" : "ambiguousEndpoint")
+        }
+        guard selected.vendor.flatMap(UInt32.init(exactly:)) == endpoint.identity.vendorID,
+              selected.product.flatMap(UInt32.init(exactly:)) == endpoint.identity.productID,
+              selected.transport == endpoint.identity.transport else { throw DeviceContractError.invalid("staleEndpoint") }
+        if case .hid(_, let usb, let interface) = endpoint.address {
+            guard selected.usbDeviceID == usb, selected.interfaceID == interface,
+                  selected.interfaceNumber == endpoint.identity.interfaceNumber,
+                  Set(selected.usages) == Set(endpoint.identity.usages) else { throw DeviceContractError.invalid("staleEndpoint") }
+        }
+        return selected
+    }
+
+    private static func openSelectedInterface(for endpoint: DeviceEndpoint) throws -> IOHIDDevice {
+        let selected = try selectedInterface(for: endpoint, from: USBDeviceGraph.enumerateHID())
+        guard let matching = IORegistryEntryIDMatching(selected.id) else { throw DeviceContractError.invalid("absentEndpoint") }
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, matching)
+        guard service != 0 else { throw DeviceContractError.invalid("absentEndpoint") }
+        defer { IOObjectRelease(service) }
+        var registryID: UInt64 = 0
+        guard IOObjectConformsTo(service, "IOHIDDevice") != 0,
+              IORegistryEntryGetRegistryEntryID(service, &registryID) == KERN_SUCCESS, registryID == selected.id,
+              MacUSBPeripheralReader.number(service, "VendorID") == selected.vendor,
+              MacUSBPeripheralReader.number(service, "ProductID") == selected.product,
+              MacUSBPeripheralReader.usbAncestor(service, includingSelf: true) == selected.usbDeviceID,
+              MacUSBPeripheralReader.vendorInterfaceID(service) == selected.interfaceID,
+              let device = IOHIDDeviceCreate(kCFAllocatorDefault, service) else { throw DeviceContractError.invalid("staleEndpoint") }
+        // No manager is opened on this path: IOHIDManagerOpen would also open
+        // every other matching current/future controller before filtering.
+        let result = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
+        guard result == kIOReturnSuccess else { throw ScreenError.message("Cannot open selected MSI HID interface: \(result)") }
+        return device
+    }
+
+    /// The guard borrows the coordinator's actual open descriptions. This
+    /// synchronous session must be destroyed on this thread before any await.
+    convenience init(selectedEndpoint: DeviceEndpoint, borrowedLease: DeviceResourceLock, replyBudget: TimeInterval = 6) throws {
+        let usb: UInt64
+        switch selectedEndpoint.address {
+        case .usb(let id, _), .hid(_, let id?, _): usb = id
+        default: throw DeviceContractError.invalid("selectedMSIEndpoint")
+        }
+        guard selectedEndpoint.identity.vendorID == 0x1462, selectedEndpoint.identity.productID == 0x3fa4 else {
+            throw DeviceContractError.invalid("selectedMSIEndpoint")
+        }
+        try self.init(replyBudget: replyBudget, selectedEndpoint: selectedEndpoint, borrowedLease: borrowedLease, expectedUSBID: usb)
+    }
+
+    private init(replyBudget: TimeInterval?, selectedEndpoint: DeviceEndpoint?, borrowedLease: DeviceResourceLock, expectedUSBID: UInt64) throws {
         if let replyBudget, !replyBudget.isFinite || replyBudget <= 0 {
             throw ScreenError.message("USB read deadline expired")
         }
         replyBudgetDeadline = replyBudget.map { ProcessInfo.processInfo.systemUptime + $0 }
-        let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("msi-screen-control", isDirectory: true)
-        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
-        lockFD = open(cache.appendingPathComponent("controller.lock").path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
-        guard lockFD >= 0 else { throw ScreenError.message("Cannot open controller lock") }
-        guard flock(lockFD, LOCK_EX | LOCK_NB) == 0 else {
-            close(lockFD)
-            throw ScreenError.message("Another msi-screen process is using the monitor")
+        let source = try USBDeviceGraph.enumerateUSB()
+        let required: DeviceResourceLock.Request
+        if let selectedEndpoint {
+            let graph = try MacUSBPeripheralReader.controlGraph(from: source)
+            required = try DeviceResourceLock.selectedRequest(selectedEndpoint, graph: graph)
+        } else {
+            let selection = try Self.builtInSelection(from: source)
+            guard selection.usbID == expectedUSBID else { throw DeviceContractError.invalid("staleEndpoint") }
+            required = selection.request
         }
-        manager = IOHIDManagerCreate(kCFAllocatorDefault, 0)
-        IOHIDManagerSetDeviceMatching(manager, [kIOHIDVendorIDKey: 0x1462, kIOHIDProductIDKey: 0x3fa4] as CFDictionary)
-        let opened = IOHIDManagerOpen(manager, 0)
-        guard opened == kIOReturnSuccess else {
-            close(lockFD)
-            throw ScreenError.message("Cannot open MSI HID manager: \(opened)")
+        guard borrowedLease.covers(required), borrowedLease.descriptor(forLegacy: "controller.lock") != nil else {
+            throw DeviceContractError.invalid("missingBorrowedLease")
         }
-        let devices = (IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>) ?? []
-        guard devices.count == 1, let found = devices.first else {
-            IOHIDManagerClose(manager, 0)
-            close(lockFD)
-            if devices.isEmpty { throw HIDConnectionError.notPresent }
-            throw ScreenError.message("Expected one MSI USB controller; found \(devices.count). Connect the monitor's USB upstream cable to this Mac.")
+        resourceLease = borrowedLease
+        if let selectedEndpoint {
+            manager = nil
+            device = try Self.openSelectedInterface(for: selectedEndpoint)
+        } else {
+            let manager = IOHIDManagerCreate(kCFAllocatorDefault, 0)
+            self.manager = manager
+            IOHIDManagerSetDeviceMatching(manager, [kIOHIDVendorIDKey: 0x1462, kIOHIDProductIDKey: 0x3fa4] as CFDictionary)
+            let opened = IOHIDManagerOpen(manager, 0)
+            guard opened == kIOReturnSuccess else { throw ScreenError.message("Cannot open MSI HID manager: \(opened)") }
+            let allDevices = (IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>) ?? []
+            let devices = allDevices.filter {
+                MacUSBPeripheralReader.usbAncestor(IOHIDDeviceGetService($0), includingSelf: true) == expectedUSBID
+            }
+            guard devices.count == 1, allDevices.count == 1, let found = devices.first else {
+                IOHIDManagerClose(manager, 0)
+                if allDevices.isEmpty { throw HIDConnectionError.notPresent }
+                if devices.isEmpty { throw DeviceContractError.invalid("staleEndpoint") }
+                throw ScreenError.message("Expected one MSI USB controller; found \(devices.count). Connect the monitor's USB upstream cable to this Mac.")
+            }
+            device = found
         }
-        device = found
         buffer = .allocate(capacity: 64)
         buffer.initialize(repeating: 0, count: 64)
         IOHIDDeviceRegisterInputReportCallback(device, buffer, 64, { context, result, _, _, _, report, count in
@@ -71,17 +162,19 @@ public final class HIDConnection: ScreenTransport {
                 connection.callbackError = result
             }
         }, Unmanaged.passUnretained(self).toOpaque())
-        IOHIDManagerScheduleWithRunLoop(manager, runLoop, CFRunLoopMode.defaultMode.rawValue)
+        if let manager { IOHIDManagerScheduleWithRunLoop(manager, runLoop, CFRunLoopMode.defaultMode.rawValue) }
+        else { IOHIDDeviceScheduleWithRunLoop(device, runLoop, CFRunLoopMode.defaultMode.rawValue) }
     }
 
     deinit {
-        IOHIDManagerUnscheduleFromRunLoop(manager, runLoop, CFRunLoopMode.defaultMode.rawValue)
+        if let manager { IOHIDManagerUnscheduleFromRunLoop(manager, runLoop, CFRunLoopMode.defaultMode.rawValue) }
+        else { IOHIDDeviceUnscheduleFromRunLoop(device, runLoop, CFRunLoopMode.defaultMode.rawValue) }
         // IOKit keys callback registrations by context, including removal.
         IOHIDDeviceRegisterInputReportCallback(device, buffer, 64, nil,
                                               Unmanaged.passUnretained(self).toOpaque())
-        IOHIDManagerClose(manager, 0)
+        if let manager { IOHIDManagerClose(manager, 0) }
+        else { IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone)) }
         buffer.deallocate()
-        close(lockFD)
         if activityAssertion != 0 { IOPMAssertionRelease(activityAssertion) }
         if displayAssertion != 0 { IOPMAssertionRelease(displayAssertion) }
     }

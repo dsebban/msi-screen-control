@@ -6,6 +6,8 @@ struct MonitorView: View {
     @ObservedObject var store: MonitorStore
     @ObservedObject var prefs: MonitorPreferences
     @ObservedObject var computers: ComputersStore
+    @ObservedObject var updater: AppUpdater
+    @ObservedObject var appSettings: AppSettings
     let closeControls: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var tab: Tab = .layout
@@ -18,7 +20,7 @@ struct MonitorView: View {
     }
 
     private enum Tab: String, CaseIterable {
-        case layout = "Layout", monitor = "Monitor", machines = "Machines", peripherals = "Peripherals"
+        case layout = "Layout", monitor = "Monitor", machines = "Machines", peripherals = "Peripherals", settings = "Settings"
     }
 
     private var motion: Animation? {
@@ -40,6 +42,8 @@ struct MonitorView: View {
                         PeripheralsView(store: store, usbHostName: usbHostName,
                                         machines: prefs.machines, configurationError: prefs.error,
                                         controlsBusy: computers.isMutating)
+                    case .settings:
+                        AppSettingsView(settings: appSettings).monitorCard()
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -70,6 +74,7 @@ struct MonitorView: View {
             case .peripherals:
                 store.refreshPeripherals()
                 store.refreshPointerCapabilities()
+            case .settings: appSettings.refresh()
             }
         }
         .sheet(item: $machineEditor) { request in
@@ -144,6 +149,7 @@ struct MonitorView: View {
 
     private func refreshControls() {
         switch tab {
+        case .settings: appSettings.refresh()
         case .layout: store.refreshKVM()
         case .monitor: store.refreshSettings()
         case .machines:
@@ -254,13 +260,20 @@ struct MonitorView: View {
         let split = pending.map { $0.mode == .pbp } ?? store.split
         let left = pending?.source1 ?? store.left
         let right = pending?.source2 ?? store.right
-        let unknown = current && store.state == nil && store.pendingTarget == nil
+        let unknown = store.state == nil && store.pendingTarget == nil
         return VStack(spacing: 0) {
             HStack(spacing: 3) {
                 if unknown {
-                    Label("Refresh to read the selected layout", systemImage: "display")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    VStack(spacing: 8) {
+                        Label("Monitor unavailable", systemImage: "display.trianglebadge.exclamationmark")
+                            .font(.subheadline.weight(.medium))
+                        if !current {
+                            Text("Reconnect the monitor, then refresh.")
+                                .font(.caption)
+                        }
+                    }
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     previewPane(left, side: split ? "Left" : "Full screen")
                     if split {
@@ -297,7 +310,7 @@ struct MonitorView: View {
         .animation(motion, value: left)
         .animation(motion, value: right)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(unknown ? "Selected layout unavailable. Refresh monitor." :
+        .accessibilityLabel(unknown ? "Monitor unavailable. Reconnect the monitor, then refresh." :
             "\(current ? store.isApplying ? "Applying layout" : "Selected layout" : "Proposed layout"): \(left.title)\(split ? " left, \(right.title) right" : " full screen")")
     }
 
@@ -783,14 +796,26 @@ struct MonitorView: View {
     private var footer: some View {
         VStack(alignment: .leading, spacing: 9) {
             Divider()
-            if let error = prefs.error ?? store.error ?? (tab == .machines ? computers.error : nil) {
+            if let version = updater.readyVersion {
+                HStack {
+                    Label("Update \(version) ready", systemImage: "arrow.down.circle.fill")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.yellow)
+                    Spacer()
+                    Button("Install…") { updater.checkForUpdates() }
+                        .accessibilityLabel("Install update")
+                        .disabled(!updater.canCheck || store.busy || computers.busy)
+                }
+            }
+            if tab != .settings, let error = prefs.error ?? store.error ?? (tab == .machines ? computers.error : nil) {
                 Text(error).font(.caption).foregroundStyle(.red)
                     .lineLimit(4)
                     .help(error)
                     .accessibilityIdentifier("monitor-error")
             }
             HStack(spacing: 8) {
-                if store.busy || computers.busy {
+                if tab == .settings {
+                    Image(systemName: "gearshape").foregroundStyle(.secondary)
+                } else if store.busy || computers.busy {
                     ProgressView().controlSize(.small)
                 } else {
                     Image(systemName: store.state != nil && !store.needsRefresh ? "checkmark.circle.fill" : "exclamationmark.circle")
@@ -816,9 +841,11 @@ struct MonitorView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Refresh current controls")
-                .accessibilityLabel(tab == .peripherals ? "Refresh peripheral controls" : "Refresh monitor")
+                .accessibilityLabel(tab == .settings ? "Refresh app settings" : tab == .peripherals ? "Refresh peripheral controls" : "Refresh monitor")
                 .disabled(store.busy || computers.busy || (tab == .peripherals && store.pointerProbeBusy))
                 Menu {
+                    Button("Settings…") { tab = .settings }
+                        .keyboardShortcut(",", modifiers: .command)
                     if tab == .layout {
                         Button("Copy CLI command") {
                             NSPasteboard.general.clearContents()
@@ -831,6 +858,11 @@ struct MonitorView: View {
                         }
                         .disabled(store.state == nil || store.duplicateInputs || store.busy)
                     }
+                    Button(updater.readyVersion == nil ? "Check for updates…" : "Install update…") {
+                        updater.checkForUpdates()
+                    }
+                    .disabled(!updater.canCheck || store.busy || computers.busy)
+                    .help("Updates are available in release builds.")
                     Button("Close controls", action: closeControls)
                         .keyboardShortcut("w", modifiers: .command)
                     Button("Quit") { NSApplication.shared.terminate(nil) }
@@ -852,6 +884,7 @@ struct MonitorView: View {
     }
 
     private var footerMessage: String {
+        if tab == .settings { return appSettings.loginStatusText }
         if tab == .machines { return machineFooterMessage }
         guard tab == .peripherals else { return store.message }
         if store.pointerProbeBusy { return "Testing mouse controls · move wheels and buttons" }

@@ -1,0 +1,4 @@
+interface:
+  display_name: "MSI Screen Control"
+  short_description: "Control MSI monitor layouts, USB, and peripherals"
+  default_prompt: "Use $msi-screen-control to inspect my monitor and apply the layout I request."

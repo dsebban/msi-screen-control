@@ -68,10 +68,9 @@ public final class ScreenController {
     func didVerifyChange() { changed = true }
 
     func validateIdentity() throws {
-        let identity = try transport.query("00140")
-        let version = try transport.query("00150")
-        guard identity == [0x30, 0x30, 0xa0], version == Array("V20".utf8) else {
-            throw ScreenError.message("Unrecognized MSI model/protocol (\(identity.hex), \(version.hex)); no settings changed")
+        let report = try identity()
+        guard report.controlSupported else {
+            throw ScreenError.message("Unrecognized MSI model/protocol (\(report.identityHex), \(report.protocolHex)); no settings changed")
         }
     }
 

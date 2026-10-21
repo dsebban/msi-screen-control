@@ -5,8 +5,10 @@ import MSIScreenCore
 
 @MainActor
 final class StatusItemController: NSObject, NSApplicationDelegate {
+    let appSettings = AppSettings()
     private let store = MonitorStore()
     private let preferences = MonitorPreferences()
+    private let updater = AppUpdater()
     private lazy var computers = ComputersStore(preferences: preferences)
     private var statusItem: NSStatusItem?
     private var panel: NSPanel?
@@ -19,10 +21,22 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
     private var changeObservers: [NSObjectProtocol] = []
     private var lastIconState: ScreenState?
     private var hasRenderedIcon = false
+    private var lastUpdateReady = false
+    private var terminationPending = false
+    private var terminationObservation: AnyCancellable?
     private var appControl: RapooAppControlServer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        appSettings.configureAtFirstLaunch()
+        updater.willShowModalAlert = { [weak self] in self?.panel?.orderOut(nil) }
+        updater.start()
+        terminationObservation = Publishers.Merge3(store.objectWillChange, computers.objectWillChange, appSettings.objectWillChange)
+            .debounce(for: .milliseconds(40), scheduler: RunLoop.main).sink { [weak self] _ in
+                guard let self, self.terminationPending, !self.hasActiveOperation else { return }
+                self.terminationPending = false
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
         if UserDefaults.standard.bool(forKey: MonitorStore.appSwitchPreference) {
             try? AppSwitchController.shared.start(mode: store.wheelHostAction)
         }
@@ -43,8 +57,8 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
             NSLog("MSI Screen CLI bridge unavailable: %@", error.localizedDescription)
         }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(systemSymbolName: "display", accessibilityDescription: "MSI Screen controls")
-        item.button?.imagePosition = .imageLeading
+        item.button?.image = MonitorAppearance.statusImage(for: nil)
+        item.button?.imagePosition = .imageOnly
         item.button?.target = self
         item.button?.action = #selector(toggleControls)
         statusItem = item
@@ -52,6 +66,7 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
                                               store.$kvm.map { _ in () }.eraseToAnyPublisher(),
                                               computers.objectWillChange.eraseToAnyPublisher(),
                                               preferences.objectWillChange.eraseToAnyPublisher())
+            .merge(with: updater.objectWillChange.map { _ in () })
             .debounce(for: .milliseconds(40), scheduler: RunLoop.main).sink { [weak self] _ in
                 guard let self else { return }
                 self.updateStatusItem(self.store.state, local: self.computers.local, peer: self.computers.peer)
@@ -70,12 +85,16 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         panel.standardWindowButton(.zoomButton)?.isHidden = true
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        panel.level = .floating
+        // Moving to the active Space depends on app activation. This menu-bar
+        // app stays inactive, so let its panel join the user's current Space,
+        // including a full-screen app's Space.
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.appearance = NSAppearance(named: .darkAqua)
         panel.backgroundColor = .clear
         panel.isOpaque = false
         let hostingView = NSHostingView(rootView: MonitorView(
-            store: store, prefs: preferences, computers: computers,
+            store: store, prefs: preferences, computers: computers, updater: updater, appSettings: appSettings,
             closeControls: { [weak panel] in panel?.orderOut(nil) }
         ))
         hostingView.sizingOptions = []
@@ -115,6 +134,21 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
             showControls()
         } else {
             store.refresh()
+        }
+        // Cua Driver's window inventory includes only normal-level windows.
+        // Give the verifier our exact floating panel ID so all interaction and
+        // screenshots still go through Cua rather than a second GUI driver.
+        let arguments = CommandLine.arguments
+        if let index = arguments.firstIndex(of: "--verification-window-file"), index + 1 < arguments.count,
+           let ownerIndex = arguments.firstIndex(of: "--verification-owner"), ownerIndex + 1 < arguments.count {
+            let receipt: [String: Any] = ["pid": ProcessInfo.processInfo.processIdentifier,
+                                          "owner": arguments[ownerIndex + 1], "windowID": panel.windowNumber]
+            do {
+                let data = try JSONSerialization.data(withJSONObject: receipt)
+                try data.write(to: URL(fileURLWithPath: arguments[index + 1]), options: .atomic)
+            } catch {
+                NSLog("MSI Screen verification window unavailable: %@", error.localizedDescription)
+            }
         }
     }
 
@@ -168,6 +202,17 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         }
     }
 
+    private var hasActiveOperation: Bool {
+        store.busy || computers.busy || store.sideWheelChangeBusy || store.topButtonChangeBusy || appSettings.changingLoginItem
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard hasActiveOperation else { return .terminateNow }
+        // An updater relaunch must let an in-flight USB write/readback finish.
+        terminationPending = true
+        return .terminateLater
+    }
+
     private func updateStatusItem(_ state: ScreenState?, local: MacDisplayState?, peer: MacDisplayState?) {
         guard let button = statusItem?.button else { return }
         let title: String
@@ -183,12 +228,14 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         } else if store.kvm?.controlHost == .upstream {
             title = "USB-B"
         } else {
-            title = "MSI ?"
+            title = "Monitor unavailable"
         }
-        button.title = " " + title
-        if !hasRenderedIcon || lastIconState != state {
-            button.image = MonitorAppearance.statusImage(for: state)
+        button.title = ""
+        let updateReady = updater.readyVersion != nil
+        if !hasRenderedIcon || lastIconState != state || lastUpdateReady != updateReady {
+            button.image = MonitorAppearance.statusImage(for: state, updateReady: updateReady)
             lastIconState = state
+            lastUpdateReady = updateReady
             hasRenderedIcon = true
         }
         button.setAccessibilityLabel("MSI Screen controls: \(title)")
@@ -205,6 +252,10 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         } else if let kvm = store.kvm, kvm.controlHost == .upstream {
             let name = preferences.machines.first { $0.id == kvm.machineID }?.name ?? "the Linux computer"
             button.toolTip = "USB control is on \(name) via USB-B.\nOpen Machines to return USB to this Mac."
+        }
+        if let version = updater.readyVersion {
+            button.setAccessibilityLabel("MSI Screen controls: \(title). Update \(version) ready")
+            button.toolTip = (button.toolTip ?? "") + "\nUpdate \(version) ready to install."
         }
     }
 
@@ -253,7 +304,10 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         } else {
             panel.center()
         }
-        panel.orderFront(nil)
+        // orderFront does not reliably raise an inactive accessory app's
+        // panel. Raise it explicitly without activating or taking key focus.
+        panel.orderFrontRegardless()
+        appSettings.refresh()
         preferences.reload()
         computers.refreshIfStale()
         if store.showingSettings { store.refreshSettings() }

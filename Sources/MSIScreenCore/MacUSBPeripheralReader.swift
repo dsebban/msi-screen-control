@@ -42,14 +42,9 @@ struct MonitorUSBTopology {
 
     func isOnMonitorHub(_ device: PeripheralUSBDevice) -> Bool {
         guard let monitorHubID else { return false }
-        var parent = device.parentID
-        var visited: Set<UInt64> = []
-        for _ in 0..<32 {
-            guard let id = parent, visited.insert(id).inserted else { return false }
-            if id == monitorHubID { return true }
-            parent = devices.first(where: { $0.id == id })?.parentID
-        }
-        return false
+        return USBDeviceGraph.ancestors(of: device.id, parent: { id in
+            devices.first(where: { $0.id == id })?.parentID
+        }).contains(monitorHubID)
     }
 }
 
@@ -95,29 +90,20 @@ enum MacUSBPeripheralReader {
                                      platform: .macos, monitorHubPresent: topology.monitorHubID != nil, receivers: receivers)
     }
 
+    /// Active configuration/session boundaries need the full source outcome and
+    /// raw ancestry. Keep the historical receiver projection below independent.
+    static func controlGraph(from source: InventorySourceSlice<USBDeviceNode>) throws -> USBDeviceGraph {
+        guard case .complete = source.outcome else { throw DeviceContractError.invalid("usbInventoryIncomplete") }
+        return try USBDeviceGraph(devices: source.values)
+    }
+
     static func enumerateUSB() throws -> [PeripheralUSBDevice] {
-        var iterator: io_iterator_t = 0
-        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOUSBHostDevice"), &iterator) == KERN_SUCCESS else {
-            throw ScreenError.message("Cannot enumerate USB devices")
-        }
-        defer { IOObjectRelease(iterator) }
-        var devices: [PeripheralUSBDevice] = []
-        while true {
-            let service = IOIteratorNext(iterator)
-            if service == 0 { break }
-            defer { IOObjectRelease(service) }
-            guard let vendor = number(service, "idVendor"), let product = number(service, "idProduct") else { continue }
-            var id: UInt64 = 0
-            guard IORegistryEntryGetRegistryEntryID(service, &id) == KERN_SUCCESS else { continue }
-            devices.append(PeripheralUSBDevice(id: id, parentID: usbAncestor(service, includingSelf: false),
-                vendor: vendor, product: product, deviceClass: number(service, "bDeviceClass") ?? -1,
-                rootHub: IOObjectConformsTo(service, "AppleUSBRootHubDevice") != 0))
-        }
-        return devices
+        do { return try USBDeviceGraph.enumerateUSB().values.compactMap(\.peripheralProjection) }
+        catch { throw ScreenError.message("Cannot enumerate USB devices") }
     }
 
     static func number(_ service: io_registry_entry_t, _ key: String) -> Int? {
-        (IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? NSNumber)?.intValue
+        USBDeviceGraph.number(service, key)
     }
 
     static func usbAncestor(_ service: io_registry_entry_t, includingSelf: Bool) -> UInt64? {
@@ -125,23 +111,7 @@ enum MacUSBPeripheralReader {
     }
 
     private static func ancestor(_ service: io_registry_entry_t, className: String, includingSelf: Bool) -> UInt64? {
-        var entry = service
-        IOObjectRetain(entry)
-        for index in 0..<32 {
-            if (includingSelf || index > 0), IOObjectConformsTo(entry, className) != 0 {
-                var id: UInt64 = 0
-                let result = IORegistryEntryGetRegistryEntryID(entry, &id)
-                IOObjectRelease(entry)
-                return result == KERN_SUCCESS ? id : nil
-            }
-            var parent: io_registry_entry_t = 0
-            let result = IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent)
-            IOObjectRelease(entry)
-            guard result == KERN_SUCCESS else { return nil }
-            entry = parent
-        }
-        IOObjectRelease(entry)
-        return nil
+        USBDeviceGraph.ancestor(service, className: className, includingSelf: includingSelf)
     }
 
     static func vendorInterfaceID(_ service: io_registry_entry_t) -> UInt64? {
@@ -150,6 +120,9 @@ enum MacUSBPeripheralReader {
 }
 
 private final class MacBoltReader {
+    // Older Bolt clients took no lock, so exclusion covers cooperating new
+    // binaries only. No process killing/retries can repair that limitation.
+    private let resourceLease: DeviceResourceLock
     private let device: IOHIDDevice
     private let runLoop = CFRunLoopGetCurrent()!
     private let buffer: UnsafeMutablePointer<UInt8>
@@ -160,6 +133,17 @@ private final class MacBoltReader {
 
     init(usbID: UInt64, readWindow: TimeInterval = 5) throws {
         deadline = ProcessInfo.processInfo.systemUptime + readWindow
+        let graph = try MacUSBPeripheralReader.controlGraph(from: USBDeviceGraph.enumerateUSB())
+        let topology = try MonitorUSBTopology(devices: graph.devices.compactMap(\.peripheralProjection))
+        guard topology.receivers(.bolt).contains(where: { $0.id == usbID && topology.isOnMonitorHub($0) }) else {
+            throw DeviceContractError.invalid("staleEndpoint")
+        }
+        let request = try DeviceResourceLock.request(usbID: usbID, graph: graph)
+        resourceLease = try DeviceResourceLock(request)
+        let currentGraph = try MacUSBPeripheralReader.controlGraph(from: USBDeviceGraph.enumerateUSB())
+        let current = try MonitorUSBTopology(devices: currentGraph.devices.compactMap(\.peripheralProjection))
+        guard current.receivers(.bolt).contains(where: { $0.id == usbID && current.isOnMonitorHub($0) }),
+              try DeviceResourceLock.request(usbID: usbID, graph: currentGraph) == request else { throw DeviceContractError.invalid("staleEndpoint") }
         var iterator: io_iterator_t = 0
         guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOHIDDevice"), &iterator) == KERN_SUCCESS else {
             throw ScreenError.message("Cannot enumerate Bolt vendor interface")

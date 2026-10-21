@@ -482,31 +482,8 @@ struct RemoteKVMEndpoint: KVMEndpoint {
     // Reject repeated fields within each object. The layout response repeats
     // identity fields legitimately in its nested ScreenState.
     private static func rejectDuplicateKeys(_ text: String) throws {
-        let bytes = Array(text.utf8)
-        var objects: [Set<String>] = []
-        var index = 0
-        while index < bytes.count {
-            if bytes[index] == 123 { objects.append([]); index += 1; continue }
-            if bytes[index] == 125 { if !objects.isEmpty { objects.removeLast() }; index += 1; continue }
-            guard bytes[index] == 34 else { index += 1; continue }
-            let start = index
-            index += 1
-            while index < bytes.count {
-                if bytes[index] == 92 { index += 2; continue }
-                if bytes[index] == 34 { break }
-                index += 1
-            }
-            guard index < bytes.count else { break }
-            let end = index
-            index += 1
-            while index < bytes.count, [9, 10, 13, 32].contains(bytes[index]) { index += 1 }
-            if index < bytes.count, bytes[index] == 58 {
-                guard let key = try? JSONDecoder().decode(String.self, from: Data(bytes[start...end])),
-                      !objects.isEmpty, objects[objects.count - 1].insert(key).inserted else {
-                    throw ScreenError.message("Linux returned duplicate USB response fields")
-                }
-            }
-        }
+        do { try StrictJSON.rejectDuplicateKeys(text) }
+        catch { throw ScreenError.message("Linux returned duplicate USB response fields") }
     }
 
     static func snapshot(_ state: Response.State) throws -> KVMSnapshot {

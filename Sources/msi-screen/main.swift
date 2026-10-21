@@ -11,6 +11,7 @@ func emit<T: Encodable>(_ object: T) throws {
 
 let help = """
 msi-screen status
+msi-screen identity
 msi-screen pbp on [--left hdmi1|hdmi2|dp|usbc] [--right hdmi1|hdmi2|dp|usbc] [--preserve-usb] [--dry-run]
 msi-screen pbp off [--preserve-usb] [--dry-run]
 msi-screen input hdmi1|hdmi2|dp|usbc [--preserve-usb] [--dry-run]
@@ -51,6 +52,8 @@ JSON output. PBP source1 is the left side; source2 is the right side.
 To swap sides, specify the two inputs in the opposite order.
 Repeating the same desired configuration performs no further writes.
 Only MSI MD342CQP / protocol V20 is supported. Firmware is never flashed.
+identity reads two model/firmware identifiers without reading or changing model-specific settings.
+It reports unmatched identities for compatibility research; shared USB IDs do not imply support.
 fullscreen exits PBP/PIP and selects the input in one verified operation.
 --preserve-usb reads the current USB owner's layout and preserves its USB route after a picture change.
 It may temporarily acquire USB-C, then return USB after verified video readback; failures report completed stages.
@@ -129,6 +132,8 @@ func machineRegistryStore() throws -> MachineRegistryStore {
     return MachineRegistryStore()
 }
 
+if let status = await dispatchInternalSupportMode(Array(CommandLine.arguments.dropFirst())) { exit(status) }
+
 var before: ScreenState?
 do {
     var args = Array(CommandLine.arguments.dropFirst())
@@ -148,7 +153,7 @@ do {
             let model = "MD342CQP"
             let protocolVersion = "V20"
             let inputs = Input.allCases
-            let commands = ["status", "pbp on [--left INPUT] [--right INPUT]", "pbp off", "input INPUT", "fullscreen INPUT",
+            let commands = ["status", "identity", "pbp on [--left INPUT] [--right INPUT]", "pbp off", "input INPUT", "fullscreen INPUT",
                             "displays", "permissions", "main monitor|built-in", "arrange left|right", "machine arrange ID left|right", "display-request", "settings", "kvm status [--machine ID]", "kvm layout [--machine ID]", "kvm set ROUTE --expected ROUTE [--machine ID]", "peripherals [--machine ID]",
                             "peripherals describe", "peripherals mouse", "peripherals mouse-map PRESET --expected-left HEX --expected-right HEX",
                             "peripherals controllers", "peripherals controller-test [--seconds 1..15]",
@@ -175,6 +180,10 @@ do {
             let displayRequestMaxBytes = 65536
         }
         try emit(Capabilities())
+        exit(0)
+    }
+    if args == ["identity"], !dryRun {
+        try emit(ScreenController.withHIDConnection { try $0.identity() })
         exit(0)
     }
     if args.first == "machine" {

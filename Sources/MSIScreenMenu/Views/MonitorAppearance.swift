@@ -37,35 +37,45 @@ enum MonitorAppearance {
     static func tint(for state: ScreenState?) -> Color { Color(nsColor: color(for: state)) }
     static func tint(for input: Input) -> Color { Color(nsColor: color(for: input)) }
 
-    static func statusImage(for state: ScreenState?) -> NSImage {
-        let fill = color(for: state)
+    static func statusImage(for state: ScreenState?, updateReady: Bool = false) -> NSImage {
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { bounds in
             guard let context = NSGraphicsContext.current?.cgContext else { return false }
             context.saveGState()
             defer { context.restoreGState() }
             context.translateBy(x: bounds.minX, y: bounds.minY)
             context.scaleBy(x: bounds.width / 18, y: bounds.height / 18)
-            context.addPath(MonitorMarkGeometry.shield.path)
             context.saveGState()
+            context.move(to: CGPoint(x: 3, y: 14))
+            context.addLine(to: CGPoint(x: 3, y: 4))
+            context.addLine(to: CGPoint(x: 9, y: 9))
+            context.addLine(to: CGPoint(x: 15, y: 4))
+            context.addLine(to: CGPoint(x: 15, y: 14))
+            context.setLineWidth(2.5)
+            context.setLineCap(.square)
+            context.setLineJoin(.miter)
+            context.replacePathWithStrokedPath()
             context.clip()
-            let dark = fill.blended(withFraction: 0.45, of: .black) ?? fill
-            if let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                                         colors: [fill.cgColor, dark.cgColor] as CFArray,
-                                         locations: [0, 1]) {
-                context.drawLinearGradient(gradient, start: CGPoint(x: 4, y: 2),
-                                           end: CGPoint(x: 13, y: 17), options: [])
+            let primary = state.map { color(for: $0.source1) } ?? NSColor(white: 0.55, alpha: 0.75)
+            context.setFillColor(primary.cgColor)
+            context.fill(CGRect(x: 0, y: 0, width: 18, height: 18))
+            if let state, state.mode != .off {
+                let secondary = state.mode == .pip ? state.pipInput : state.source2
+                context.setFillColor(color(for: secondary).cgColor)
+                // PBP follows the physical left/right order. PIP keeps a
+                // smaller secondary accent instead of implying equal halves.
+                context.fill(state.mode == .pbp
+                    ? CGRect(x: 9, y: 0, width: 9, height: 18)
+                    : CGRect(x: 12, y: 10, width: 6, height: 8))
             }
             context.restoreGState()
-            context.addPath(MonitorMarkGeometry.shield.path)
-            context.setStrokeColor(NSColor.white.withAlphaComponent(0.75).cgColor)
-            context.setLineWidth(0.7)
-            context.strokePath()
-            context.addPath(MonitorMarkGeometry.letter.path)
-            context.setStrokeColor(NSColor.white.cgColor)
-            context.setLineWidth(1.8)
-            context.setLineCap(.round)
-            context.setLineJoin(.round)
-            context.strokePath()
+            if updateReady {
+                let badge = CGRect(x: 12.5, y: 0.5, width: 5, height: 5)
+                context.setFillColor(NSColor.systemYellow.cgColor)
+                context.fillEllipse(in: badge)
+                context.setStrokeColor(NSColor.black.withAlphaComponent(0.6).cgColor)
+                context.setLineWidth(0.75)
+                context.strokeEllipse(in: badge)
+            }
             return true
         }
         image.isTemplate = false

@@ -136,6 +136,16 @@ final class KVMCoordinatorTests: XCTestCase {
         XCTAssertEqual(local.reads, 1)
     }
 
+    func testLegacyDecoderKeepsUnknownFieldAcceptanceButRejectsEscapedDuplicates() throws {
+        let json = #"{"schemaVersion":1,"action":"status","present":false,"accessible":false,"writeAttempted":false,"writeCompleted":false,"acknowledged":false,"verified":false,"outcome":"not_present","future":{"field":1}}"#
+        func output(_ text: String) -> ProcessRunner.Output {
+            ProcessRunner.Output(text: text, exitCode: 0, timedOut: false, truncated: false)
+        }
+        XCTAssertFalse(try RemoteKVMEndpoint.decode(output(json), action: "status").present)
+        let duplicate = json.replacingOccurrences(of: #""present":false"#, with: #""present":false,"pr\u0065sent":true"#)
+        XCTAssertThrowsError(try RemoteKVMEndpoint.decode(output(duplicate), action: "status"))
+    }
+
     func testScalarPacketsMatchVendorKVMCommands() throws {
         for (route, command) in [(KVMRoute.upstream, "5b008>0001\r"), (.usbc, "5b008>0002\r")] {
             let expected = [UInt8(1)] + Array(command.utf8)

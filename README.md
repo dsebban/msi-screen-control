@@ -123,8 +123,11 @@ F20 and the wheel controls are independent: restoring horizontal scrolling leave
 
 ## CLI and agent use
 
+**Settings → Install agent skill** installs the bundled `msi-screen-control` skill into `~/.agents/skills`, for Codex and other compatible agents. It is available on the next agent turn; invoke it with `$msi-screen-control` or ask to control this monitor. The skill locates the app's embedded CLI, discovers the installed commands, and covers layout, settings, saved computers, displays, USB and peripheral controls. Reinstalling identical files is harmless; a different or edited existing skill is left untouched. The distributable source is [skills/msi-screen-control](skills/msi-screen-control/SKILL.md).
+
 ```sh
 msi-screen capabilities                         # Offline, machine-readable command discovery
+msi-screen identity                             # Read-only model/firmware report (source build)
 msi-screen status                               # Read live monitor state
 msi-screen pbp on --left dp --right usbc --dry-run
 msi-screen pbp on --left dp --right usbc
@@ -139,6 +142,8 @@ msi-screen displays                              # This Mac's video displays and
 msi-screen main monitor --dry-run
 msi-screen main built-in                         # Make this Mac's laptop display main
 ```
+
+For additional models, start with `identity` from the current source build. It reads only the two MSI model/firmware identifiers and reports whether they match the enabled control profile. It does not probe setting registers or infer compatibility from the shared USB ID. See [model compatibility](docs/compatibility.md) for evidence and the next candidate. This diagnostic is newer than the v0.2.0 release.
 
 Use the same machine IDs in the app's shared list and CLI:
 
@@ -259,6 +264,14 @@ The managed entrypoint requires Bun, OMP and Cua Driver. `OMP_LAUNCH_CLIENT` can
 
 ## Verification and releases
 
+**Settings → Launch at login** starts MSI Screen in the menu bar when you sign in. It defaults on once after the app's first launch from `/Applications` or `~/Applications`; turning it off persists across restarts and updates. The setting reads macOS's actual login-item state, including changes made in System Settings. If macOS requires approval, the app shows that state and links to Login Items. Temporary verification copies do not register themselves. Use `python3 scripts/verify.py --gui --login-item` to toggle the installed app both ways, independently check macOS registration, and restore the original setting. This does not log you out.
+
+Starting with v0.3.0, release builds use [Sparkle](https://sparkle-project.org/) for signed in-app updates. The app checks and downloads in the background. Once a download is verified and staged, a small yellow dot appears on the M and the controls show **Update ready → Install…**. **App actions → Check for updates…** checks manually. Install and relaunch now, or let the staged update install when you quit. The app waits for active monitor, display or mouse configuration operations to finish. Debug builds keep updating disabled so a release cannot replace a development build.
+
+Install the first updater-enabled release manually once. Earlier versions have no updater. Future releases deliver `appcast.xml` alongside their signed, notarized universal ZIP. The updater authenticates the feed and archive before extraction; it never runs a downloaded shell script. The public key and feed address live in `config/updates.json`. The private EdDSA key stays in the release Mac's Keychain under the configured account; keep a secure backup using Sparkle's `generate_keys` tool and never commit or upload it.
+
+`python3 scripts/verify.py --gui --update-fixture "/path/to/release/MSI Screen.app"` checks the real signed-download path with isolated app copies and a loopback feed. It captures the staged reminder and badge, quits only its test app, and verifies that Sparkle replaces that copy with the signed new version. It compares the installed app, CLI and skill bytes with the release, relaunches the replaced app in the background, and opens its Settings. With explicit permission for foreground interaction, add `--install-update` to click **Install… → Install and Relaunch** instead and observe Sparkle's automatic relaunch before any verifier launch. Both modes clean up only their test processes and leave the real installed app intact; neither publishes anything.
+
 The project uses one verification entrypoint, [scripts/verify.py](scripts/verify.py), with separate offline and real-hardware modes:
 
 ```sh
@@ -323,7 +336,7 @@ NOTARY_KEYCHAIN_PROFILE=your-saved-profile ./script/release-dmg.sh
 
 This builds a universal app, notarizes and staples it, creates the ZIP and drag-to-Applications DMG, then signs, notarizes and staples the DMG. It mounts only its own DMG read-only, validates the installer shortcut, both architectures, hardened runtime, secure timestamps, Apple tickets and Gatekeeper acceptance, and exercises the embedded CLI. Logs and Apple submission receipts stay in ignored `.local/`; no credentials are bundled or uploaded to GitHub. A failed or timed-out notarization must be inspected by its saved submission ID before another submission.
 
-Upload the resulting `.dmg`, `.zip` and `SHA256SUMS` from `dist/release-vVERSION/` to that draft and publish after the checks pass. Recheck a downloaded copy with `python3 scripts/verify.py --offline --dmg /path/to/download.dmg` and `shasum -a 256 -c SHA256SUMS`.
+The release script also runs `script/generate-appcast.sh` to sign the ZIP and produce `appcast.xml`, using the matching Keychain key. Upload the resulting `.dmg`, `.zip`, `appcast.xml` and `SHA256SUMS` from `dist/release-vVERSION/` to that draft and publish after the checks pass. The app reads the feed from the latest GitHub release; publishing that release makes it available to installed updater-enabled copies. Do not point the feed at ad hoc CI artifacts or manually edit the signed feed. Recheck a downloaded copy with `python3 scripts/verify.py --offline --dmg /path/to/download.dmg` and `shasum -a 256 -c SHA256SUMS`.
 
 ## Protocol provenance
 

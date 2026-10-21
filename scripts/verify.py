@@ -5,6 +5,7 @@ import copy
 import datetime
 import fcntl
 import hashlib
+import http.server
 import json
 import math
 import os
@@ -12,14 +13,21 @@ from pathlib import Path
 import plistlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
+import threading
 import uuid
 from cua_session import CuaSession
 
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--agent-skill-fixture', type=Path, help='With --gui, use an isolated app copy to install its agent skill into this user\'s ~/.agents/skills, then verify the real installed files; leave the requested skill installed')
+parser.add_argument('--login-item', action='store_true', help='With --gui, toggle launch at login in the installed app and restore its baseline; verify macOS registration independently')
+parser.add_argument('--update-fixture', type=Path, help='With --gui, use this release app to verify a real signed Sparkle download in isolated app copies')
+parser.add_argument('--install-update', action='store_true', help='With --update-fixture, exercise Install and Relaunch; requires explicit permission for Sparkle to activate its installer')
+parser.add_argument('--menu-appearance', action='store_true', help='With --gui, verify the popup and unavailable layout without requiring an attached monitor')
 parser.add_argument('--permissions', action='store_true', help='Inspect the running app TCC/signing status; --gui launches and validates the permission card without changing grants')
 parser.add_argument('--previous-app', type=Path, help='With --offline --app, require the new app to satisfy the previous certificate-signed app identity')
 parser.add_argument('--peripherals', action='store_true', help='Read receiver topology and device details; add --gui for Machines and Peripherals screens')
@@ -51,6 +59,28 @@ parser.add_argument('--binary', type=Path, default=root / '.build/debug/msi-scre
 parser.add_argument('--app', type=Path, help='Packaged app to validate in offline mode')
 parser.add_argument('--dmg', type=Path, help='With --offline, mount a signed/notarized universal DMG read-only and verify its app, CLI and install shortcut')
 args = parser.parse_args()
+if args.install_update and not args.update_fixture:
+    parser.error('--install-update requires --update-fixture and explicit foreground approval')
+if args.agent_skill_fixture and (not args.gui or any((args.offline, args.login_item, args.menu_appearance,
+        args.permissions, args.update_fixture, args.peripherals, args.exercise, args.exercise_controls,
+        args.exercise_arrangement, args.exercise_peer_controls, args.exercise_machine, args.exercise_machine_editor,
+        args.exercise_kvm, args.exercise_focus, args.peer_host, args.sharing, args.usb_route, args.idle_seconds))):
+    parser.error('--agent-skill-fixture requires --gui and is separate from other checks')
+if args.login_item and (not args.gui or any((args.offline, args.menu_appearance, args.permissions,
+        args.update_fixture, args.peripherals, args.exercise, args.exercise_controls, args.exercise_arrangement,
+        args.exercise_peer_controls, args.exercise_machine, args.exercise_machine_editor,
+        args.exercise_kvm, args.exercise_focus, args.peer_host, args.sharing, args.usb_route, args.idle_seconds))):
+    parser.error('--login-item requires --gui and is separate from other checks')
+if args.update_fixture and (not args.gui or any((args.offline, args.menu_appearance, args.permissions,
+        args.peripherals, args.exercise, args.exercise_controls, args.exercise_arrangement,
+        args.exercise_peer_controls, args.exercise_machine, args.exercise_machine_editor,
+        args.exercise_kvm, args.exercise_focus, args.peer_host, args.sharing, args.usb_route, args.idle_seconds))):
+    parser.error('--update-fixture requires --gui and is separate from other checks')
+if args.menu_appearance and (not args.gui or any((args.offline, args.permissions, args.peripherals,
+        args.exercise, args.exercise_controls, args.exercise_arrangement, args.exercise_peer_controls,
+        args.exercise_machine, args.exercise_machine_editor, args.exercise_kvm, args.exercise_focus,
+        args.peer_host, args.sharing, args.usb_route, args.idle_seconds))):
+    parser.error('--menu-appearance requires --gui and is separate from other checks')
 if args.previous_app and not (args.offline and (args.app or args.dmg)):
     parser.error('--previous-app requires --offline and --app or --dmg')
 if args.dmg and (not args.offline or args.app):
@@ -274,6 +304,9 @@ def offline():
         help_result = run('--help')
         assert 'msi-screen fullscreen' in help_result['stdout'], 'CLI help is missing'
         capability = run('capabilities')
+        if 'identity' in capability['commands']:
+            run('identity', '--dry-run', success=False)
+            run('identity', '--unknown', success=False)
         assert capability['schemaVersion'] == 1
         assert capability['model'] == 'MD342CQP' and capability['protocolVersion'] == 'V20'
         assert set(capability['inputs']) == {'hdmi1', 'hdmi2', 'dp', 'usbc'}
@@ -363,6 +396,19 @@ def offline():
             assert 'msi-screen' in info['CFBundleURLTypes'][0]['CFBundleURLSchemes']
             assert binary == app / 'Contents/MacOS/msi-screen', 'Smoke must run the packaged CLI'
             assert (app / 'Contents/Resources/LICENSE').read_text() == (root / 'LICENSE').read_text(), 'Packaged license is missing or stale'
+            skill = root / 'skills/msi-screen-control'
+            bundled_skill = app / 'Contents/Resources/AgentSkills/msi-screen-control'
+            for source in skill.rglob('*'):
+                if source.is_file():
+                    assert (bundled_skill / source.relative_to(skill)).read_bytes() == source.read_bytes(), 'Bundled agent skill is missing or stale'
+            updates = json.loads((root / 'config/updates.json').read_text())
+            assert info['SUFeedURL'] == updates['feedURL']
+            assert info['SUPublicEDKey'] == updates['publicKey']
+            assert info['SURequireSignedFeed'] is True and info['SUAutomaticallyUpdate'] is True
+            assert info['SUVerifyUpdateBeforeExtraction'] is True
+            sparkle = app / 'Contents/Frameworks/Sparkle.framework'
+            assert (sparkle / 'Sparkle').is_file(), 'Sparkle framework is missing'
+            assert (app / 'Contents/Resources/Sparkle-LICENSE').is_file(), 'Sparkle license is missing'
             for executable in [binary, app / 'Contents/MacOS' / info['CFBundleExecutable']]:
                 assert executable.is_file() and os.access(executable, os.X_OK)
                 # The release must not depend on Homebrew or a developer checkout.
@@ -372,7 +418,8 @@ def offline():
                     if line.startswith(str(executable)) and line.endswith(':'):
                         continue
                     library = line.strip().split(' (', 1)[0]
-                    assert library.startswith(('/System/Library/', '/usr/lib/', '@rpath/libswift')), library
+                    bundled_sparkle = executable.name == info['CFBundleExecutable'] and library == '@rpath/Sparkle.framework/Versions/B/Sparkle'
+                    assert bundled_sparkle or library.startswith(('/System/Library/', '/usr/lib/', '@rpath/libswift')), library
             subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)], check=True)
             summary['app'] = str(app)
             if args.dmg:
@@ -464,6 +511,294 @@ def gui_snapshot(label, screenshot=False, window=None):
 def gui_menu_bar(label):
     result = cua.call('get_desktop_state', screenshot_out_file=str(output / (label + '-menubar.png')))
     (output / (label + '-menubar.json')).write_text(json.dumps(result, indent=2))
+
+
+def gui_inspect_menu_appearance():
+    global gui_window
+    status = run('status', success=None)
+    unavailable = status.get('verified') is False and 'error' in status
+    if unavailable:
+        gui_wait_for('gui-unavailable', lambda tree: 'Monitor unavailable' in tree)
+    else:
+        gui_ready('gui-appearance-ready')
+    gui_snapshot('gui-appearance-before-close', screenshot=True)
+    gui_close_controls()
+    assert not any(w['window_id'] == gui_window and w.get('is_on_screen')
+                   for w in cua.call('list_windows', pid=gui_pid)['windows']), 'Controls did not close'
+    gui_menu_bar('gui-appearance-closed')
+    reopened = cua.call('launch_app', bundle_id='com.danielsivan.msi-screen.menu', urls=['msi-screen://controls'])
+    assert reopened['pid'] == gui_pid, 'Reopen reached a different process'
+    gui_wait_for('gui-appearance-reopened', lambda tree: 'Machines' in tree)
+    if unavailable:
+        gui_wait_for('gui-unavailable-reopened', lambda tree: 'Monitor unavailable' in tree)
+    snapshot = gui_snapshot('gui-appearance-result', screenshot=True)
+    if unavailable:
+        assert 'Proposed layout:' not in snapshot.get('tree_markdown', ''), 'Unavailable monitor retained a colored draft'
+    gui_menu_bar('gui-appearance-result')
+    summary['menuAppearance'] = {'unavailable': unavailable, 'panelWindow': gui_window,
+                               'desktopStacking': 'VISUAL_REVIEW_REQUIRED',
+                               'trigger': 'msi-screen://controls', 'physicalMenuBarClickTested': False}
+
+
+def prepare_update_fixture(source):
+    """Serve a signed real update locally; no production app or preferences are changed."""
+    fixture = output / 'update-fixture'
+    fixture.mkdir()
+    served = fixture / 'served'
+    served.mkdir()
+    handler = lambda *a, **kw: http.server.SimpleHTTPRequestHandler(*a, directory=str(served), **kw)
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = 'http://127.0.0.1:' + str(server.server_port) + '/'
+    bundle_id = 'com.danielsivan.msi-screen.update-fixture-' + uuid.uuid4().hex
+    # Read the artifact's signer, not an unrelated running app's identity.
+    signing = subprocess.run(['codesign', '-dvv', str(source)], capture_output=True, text=True, check=True)
+    signers = re.findall(r'^Authority=(Developer ID Application:[^\n]+)', signing.stderr, re.MULTILINE)
+    assert len(signers) == 1, 'The update fixture needs a Developer ID signed release app'
+    paths = []
+    latest_version = (root / 'VERSION').read_text().strip()
+    for name, version in [('installed', '0.0.1'), ('release', latest_version)]:
+        parent = fixture / name
+        parent.mkdir()
+        app = parent / 'MSI Screen.app'
+        subprocess.run(['ditto', str(source), str(app)], check=True)
+        plist = app / 'Contents/Info.plist'
+        info = plistlib.loads(plist.read_bytes())
+        info.update(CFBundleIdentifier=bundle_id, CFBundleVersion=version, CFBundleShortVersionString=version,
+                    SUFeedURL=base + 'appcast.xml', SUEnableAutomaticChecks=True,
+                    NSAppTransportSecurity={'NSAllowsLocalNetworking': True})
+        info.pop('CFBundleURLTypes', None)  # Keep the production URL handler unchanged.
+        plist.write_bytes(plistlib.dumps(info))
+        subprocess.run(['codesign', '--force', '--timestamp=none', '--identifier', bundle_id,
+                        '--sign', signers[0], str(app)], check=True)
+        paths.append(app)
+    archive = served / 'MSI-Screen-update-test.zip'
+    subprocess.run(['ditto', '-c', '-k', '--keepParent', str(paths[1]), str(archive)], check=True)
+    settings = json.loads((root / 'config/updates.json').read_text())
+    subprocess.run([str(root / '.build/artifacts/sparkle/Sparkle/bin/generate_appcast'),
+                    '--account', settings['keychainAccount'], '--maximum-deltas', '0',
+                    '--download-url-prefix', base, str(served)], check=True)
+    subprocess.run(['/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister',
+                    '-f', str(paths[0])], check=True)
+    return server, bundle_id
+
+
+def prepare_agent_skill_fixture(source):
+    app = output / 'agent-skill-fixture/MSI Screen.app'
+    app.parent.mkdir()
+    subprocess.run(['ditto', str(source), str(app)], check=True)
+    bundle_id = 'com.danielsivan.msi-screen.skill-fixture-' + uuid.uuid4().hex
+    plist = app / 'Contents/Info.plist'
+    info = plistlib.loads(plist.read_bytes())
+    info.update(CFBundleIdentifier=bundle_id, SUEnableAutomaticChecks=False)
+    info.pop('CFBundleURLTypes', None)  # Do not claim the installed app's URL scheme.
+    plist.write_bytes(plistlib.dumps(info))
+    subprocess.run(['codesign', '--force', '--sign', '-', str(app)], check=True)
+    subprocess.run(['/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister',
+                    '-f', str(app)], check=True)
+    return bundle_id
+
+
+def gui_inspect_agent_skill():
+    gui_click('Settings', 'AXButton')
+    source = args.agent_skill_fixture.resolve() / 'Contents/Resources/AgentSkills/msi-screen-control'
+    destination = Path.home() / '.agents/skills/msi-screen-control'
+    for label in ('installed', 'repeated'):
+        gui_click('Install agent skill', 'AXButton')
+        gui_wait_for('gui-agent-skill-' + label, lambda tree:
+                     'Available on your next agent turn.' in tree,
+                     failed=('A different skill already exists', 'The agent skill is missing'))
+        gui_snapshot('gui-agent-skill-' + label, screenshot=True)
+        expected = {str(p.relative_to(source)): p.read_bytes() for p in source.rglob('*') if p.is_file()}
+        actual = {str(p.relative_to(destination)): p.read_bytes() for p in destination.rglob('*') if p.is_file()}
+        assert actual == expected and 'SKILL.md' in actual, 'Installed skill differs from the real app resources'
+    summary['agentSkill'] = {'installedForUser': True, 'destination': str(destination),
+                             'filesMatched': sorted(actual), 'repeatedInstallVerified': True,
+                             'productionAppModified': False}
+
+
+def gui_inspect_update():
+    ready = gui_wait_for('gui-update-downloaded', lambda tree: 'Update ' + (root / 'VERSION').read_text().strip() + ' ready' in tree,
+                         failed=('Update Error',), timeout=90)
+    assert any(e.get('label') == 'Install update' and e.get('enabled', True) for e in ready['elements'])
+    gui_snapshot('gui-update-ready', screenshot=True)
+    gui_menu_bar('gui-update-ready')
+    # Sparkle activates its user-initiated dialog. The default check stays in
+    # the background; --install-update requires separate foreground approval.
+    summary['updateFixture'] = {'signedDownloadReady': True, 'installActionExposed': True,
+                                'installDialogTested': False, 'installed': False,
+                                'productionModified': False, 'fromVersion': '0.0.1',
+                                'toVersion': (root / 'VERSION').read_text().strip(), 'feed': 'signed loopback fixture'}
+    if args.install_update:
+        gui_install_update()
+
+
+def gui_install_update():
+    gui_click('Install update', 'AXButton')
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        for window in cua.call('list_windows', pid=gui_pid)['windows']:
+            if window['window_id'] == gui_window:
+                continue
+            state = gui_snapshot('gui-sparkle-install-dialog', screenshot=True, window=window['window_id'])
+            buttons = [e for e in state['elements'] if e.get('role') == 'AXButton'
+                       and e.get('label') == 'Install and Relaunch' and e.get('enabled', True)]
+            if len(buttons) == 1:
+                target = (window['window_id'], buttons[0]['element_token'])
+                break
+        else:
+            time.sleep(0.2)
+            continue
+        break
+    else:
+        raise RuntimeError('Sparkle Install and Relaunch dialog did not appear')
+    try:
+        result = cua.call('click', pid=gui_pid, window_id=target[0], element_token=target[1],
+                          delivery_mode='background')
+        with (output / 'actions.jsonl').open('a') as f:
+            f.write(json.dumps({'action': ['gui-click', 'Install and Relaunch'], 'result': result}) + '\n')
+    except Exception:
+        if owns_gui_process():
+            raise
+    # Sparkle launches the replacement itself. Observe that process before any
+    # verifier launch, so a manual relaunch cannot masquerade as this result.
+    executable = str(output / 'update-fixture/installed/MSI Screen.app/Contents/MacOS/MSIScreenMenu')
+    relaunched_pid = None
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        processes = subprocess.check_output(['ps', '-axo', 'pid=,comm='], text=True)
+        matches = [int(parts[0]) for line in processes.splitlines()
+                   if len(parts := line.strip().split(None, 1)) == 2 and parts[1] == executable
+                   and int(parts[0]) != gui_pid]
+        if not owns_gui_process() and len(matches) == 1:
+            relaunched_pid = matches[0]
+            break
+        time.sleep(0.2)
+    assert relaunched_pid, 'Sparkle did not automatically relaunch the replacement'
+    summary['guiProcessExited'] = True
+    summary['updateFixture'].update(installDialogTested=True, automaticallyRelaunched=True,
+                                    automaticRelaunchPID=relaunched_pid)
+    print(json.dumps({'action': ['observe-sparkle-automatic-relaunch'], 'pid': relaunched_pid}), flush=True)
+
+    def owns_relaunched_process():
+        observed = subprocess.run(['ps', '-p', str(relaunched_pid), '-o', 'comm='], capture_output=True, text=True)
+        return observed.stdout.strip() == executable
+
+    # Reopen controls only in our uniquely identified fixture, then request a
+    # normal Quit. The installed production app has a different bundle ID/path.
+    reopened = cua.call('launch_app', bundle_id=update_bundle_id, urls=['msi-screen://controls'])
+    assert reopened['pid'] == relaunched_pid and owns_relaunched_process(), 'Reopen selected a different app'
+    try:
+        cua.call('hotkey', pid=relaunched_pid, keys=['cmd', 'q'], delivery_mode='background')
+    except Exception:
+        if owns_relaunched_process():
+            # Only our disposable, read-only test copy may need escalation if
+            # the driver cannot target an accessory app's floating panel.
+            cua.call('kill_app', pid=relaunched_pid)
+    deadline = time.monotonic() + 3
+    while owns_relaunched_process() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not owns_relaunched_process(), 'Automatically relaunched fixture did not exit'
+    summary['updateFixture']['automaticRelaunchProcessExited'] = True
+
+
+def gui_relaunch_updated_fixture(bundle_id):
+    """Launch the replaced bundle in the background and drive its real Settings."""
+    global cua, owner, gui_pid, gui_window, gui_owned
+    cua = CuaSession()
+    owner = 'msi-update-relaunch-' + uuid.uuid4().hex
+    receipt_path = output / 'gui-relaunch-window.json'
+    try:
+        launched = cua.call('launch_app', bundle_id=bundle_id, creates_new_application_instance=True,
+                           additional_arguments=['--show-controls', '--verification-owner', owner,
+                                                 '--verification-window-file', str(receipt_path),
+                                                 '--supervisor', str(os.getpid())])
+        gui_pid = launched['pid']
+        gui_owned = owns_gui_process()
+        assert gui_owned, 'Relaunch did not create our owned process'
+        receipt = json.loads(receipt_path.read_text())
+        assert receipt['pid'] == gui_pid and receipt['owner'] == owner, 'Relaunch receipt belongs to another instance'
+        gui_window = receipt['windowID']
+        gui_wait_for('gui-updated-health', lambda tree: 'Machines' in tree)
+        gui_click('Settings', 'AXButton')
+        gui_wait_for('gui-updated-settings', lambda tree: 'Install agent skill' in tree and 'Launch at login' in tree)
+        gui_snapshot('gui-updated-relaunched', screenshot=True)
+        summary['updateFixture']['relaunchedUpdatedApp'] = True
+    finally:
+        try:
+            if gui_owned and owns_gui_process():
+                try:
+                    gui_named_menu('App actions')
+                    gui_click('Quit', 'AXMenuItem')
+                except Exception:
+                    if owns_gui_process():
+                        raise
+                deadline = time.monotonic() + 3
+                while owns_gui_process() and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                assert not owns_gui_process(), 'Relaunched fixture did not quit'
+                summary['updateFixture']['relaunchedProcessExited'] = True
+        finally:
+            cua.close()
+
+
+def login_item_registration(label):
+    result = subprocess.run(['sfltool', 'dumpbtm'], capture_output=True, text=True, timeout=15, check=True)
+    sections = re.split(r'(?m)^ Records for UID (-?\d+) :[^\n]*\n', result.stdout)
+    records = []
+    for uid, section in zip(sections[1::2], sections[2::2]):
+        if int(uid) != os.getuid():
+            continue
+        for record in re.split(r'(?m)^ #\d+:\n', section):
+            if not re.search(r'(?m)^\s*Bundle Identifier: com\.danielsivan\.msi-screen\.menu\s*$', record):
+                continue
+            kind = re.search(r'(?m)^\s*Type: (.+)$', record)
+            if kind is None or '(0x4)' not in kind[1]:
+                continue  # An app inventory record alone is not a login item.
+            disposition = re.search(r'(?m)^\s*Disposition: \[([^]]*)\]', record)
+            assert disposition, 'Login item has no observable disposition'
+            records.append({'type': kind[1], 'flags': [s.strip() for s in disposition[1].split(',')]})
+    report = {'records': records, 'enabled': any('enabled' in r['flags'] and 'allowed' in r['flags'] for r in records)}
+    (output / (label + '-registration.json')).write_text(json.dumps(report, indent=2) + '\n')
+    print(json.dumps({'action': ['observe-login-item', label], **report}), flush=True)
+    return report
+
+
+def gui_login_item_value():
+    state = gui_snapshot('gui-login-item-current', screenshot=True)
+    controls = [e for e in state['elements'] if e.get('label') == 'Launch at login'
+                and e.get('role') in ('AXCheckBox', 'AXSwitch')]
+    assert len(controls) == 1, 'Launch at login toggle is missing or ambiguous'
+    assert str(controls[0].get('value')) in ('0', '1'), 'Login item state is unobservable'
+    return str(controls[0]['value']) == '1'
+
+
+def gui_inspect_login_item():
+    gui_click('Settings', 'AXButton')
+    initial = gui_login_item_value()
+    assert login_item_registration('baseline')['enabled'] == initial, 'UI differs from native login item state'
+    owned = initial
+    try:
+        for target in (not initial, initial):
+            assert gui_login_item_value() == owned, 'Login item changed outside this exercise'
+            gui_click('Launch at login')
+            owned = target
+            label = 'enabled' if target else 'disabled'
+            gui_wait_for('gui-login-item-' + label, lambda tree:
+                         ('Launch at login is enabled.' if target else 'Launch at login is off.') in tree)
+            assert gui_login_item_value() == target, 'Login item toggle did not change'
+            assert login_item_registration(label)['enabled'] == target, 'macOS registration differs from the toggle'
+        summary['loginItem'] = {'enabled': initial, 'toggledBothDirections': True,
+                                'nativeRegistrationMatched': True, 'restored': True,
+                                'actualLogoutTested': False}
+    finally:
+        current = gui_login_item_value()
+        if current != initial:
+            assert current == owned, 'Login item changed elsewhere; refusing to overwrite it'
+            gui_click('Launch at login')
+            gui_wait_for('gui-login-item-restored', lambda tree:
+                         ('Launch at login is enabled.' if initial else 'Launch at login is off.') in tree)
+            assert login_item_registration('restored')['enabled'] == initial
 
 
 def gui_wait_across_poll(label):
@@ -995,7 +1330,7 @@ def profile_gui_idle(seconds):
     reopened = cua.call('launch_app', bundle_id='com.danielsivan.msi-screen.menu', urls=['msi-screen://controls'])
     assert reopened['pid'] == gui_pid, 'Idle profile reopened a different app process'
     windows = reopened.get('windows') or cua.call('list_windows', pid=gui_pid)['windows']
-    gui_window = next(w['window_id'] for w in windows if w.get('title') == 'MSI Screen')
+    gui_window = next((w['window_id'] for w in windows if w.get('title') == 'MSI Screen'), gui_window)
     gui_ready('gui-idle-reopened')
     assert read_state('status') == monitor_before, 'Monitor changed during idle profiling'
     profile['verdict'] = 'MEASURED'
@@ -2177,12 +2512,24 @@ def exercise_brightness():
 
 
 try:
-    if args.peripherals or args.permissions:
+    update_server = None
+    update_bundle_id = 'com.danielsivan.msi-screen.menu'
+    if args.update_fixture:
+        update_server, update_bundle_id = prepare_update_fixture(args.update_fixture.resolve())
+    if args.agent_skill_fixture:
+        update_bundle_id = prepare_agent_skill_fixture(args.agent_skill_fixture.resolve())
+    if args.peripherals or args.permissions or args.menu_appearance or args.update_fixture or args.login_item or args.agent_skill_fixture:
         registry_baseline = run('machine', 'list')
         summary['machines'] = registry_baseline
     else:
         baseline = read_state('status')  # Health-check the real USB controller before actions.
         summary['baseline'] = baseline
+        if 'identity' in run('capabilities')['commands']:
+            identity = run('identity')
+            assert identity['controlSupported'] is True
+            assert identity['matchedProfile'] == baseline['model'] + '/' + baseline['protocolVersion']
+            assert bytes.fromhex(identity['protocolHex']).decode('ascii') == baseline['protocolVersion']
+            summary['monitorIdentity'] = identity
         settings_baseline = run('settings')
         assert settings_baseline['layout'] == baseline
         assert isinstance(settings_baseline['values'], dict) and isinstance(settings_baseline['unavailable'], dict)
@@ -2219,9 +2566,11 @@ try:
     if args.gui:
         cua = CuaSession()
         owner = 'msi-verification-' + uuid.uuid4().hex
-        launched = cua.call('launch_app', bundle_id='com.danielsivan.msi-screen.menu',
+        window_receipt = output / 'gui-window.json'
+        launched = cua.call('launch_app', bundle_id=update_bundle_id,
                             creates_new_application_instance=True,
-                            additional_arguments=['--show-controls', '--verification-owner', owner,
+            additional_arguments=['--show-controls', '--verification-owner', owner,
+                                                  '--verification-window-file', str(window_receipt),
                                                   '--supervisor', str(os.getpid())])
         gui_pid = launched['pid']
         # list_apps omits some accessory apps. Prove our unique launch argument
@@ -2232,15 +2581,23 @@ try:
         windows = launched.get('windows', [])
         if not windows:
             windows = cua.call('list_windows', pid=gui_pid)['windows']
-        gui_window = next(w['window_id'] for w in windows if w.get('title') == 'MSI Screen')
-        if args.peripherals or args.permissions:
+        gui_window = next((w['window_id'] for w in windows if w.get('title') == 'MSI Screen'), None)
+        if gui_window is None:
+            # Floating panels are absent from Cua's layer-0 inventory. Use the
+            # owned app's bootstrap receipt, then let Cua independently validate
+            # the window's PID and capture its live accessibility/pixel state.
+            receipt = json.loads(window_receipt.read_text())
+            assert receipt['pid'] == gui_pid and receipt['owner'] == owner, 'Window receipt is not ours'
+            gui_window = receipt['windowID']
+            assert isinstance(gui_window, int) and gui_window > 0, 'Invalid panel window ID'
+        if args.peripherals or args.permissions or args.menu_appearance or args.update_fixture or args.login_item or args.agent_skill_fixture:
             gui_wait_for('gui-health', lambda tree: 'Machines' in tree)
         else:
             gui_ready('gui-health')
             assert read_state('status') == baseline, 'Opening the app changed the monitor'
         # A peer-only exercise has its own GUI health and identity checks.
         # Keep it independent of the longer layout polling/draft exercise.
-        if not (args.exercise_peer_controls or args.exercise_machine or args.exercise_machine_editor or args.idle_seconds or args.usb_route or args.exercise_kvm or args.exercise_focus or args.peripherals or args.permissions or args.exercise_arrangement) or args.exercise or args.exercise_controls or args.sharing:
+        if not (args.exercise_peer_controls or args.exercise_machine or args.exercise_machine_editor or args.idle_seconds or args.usb_route or args.exercise_kvm or args.exercise_focus or args.peripherals or args.permissions or args.exercise_arrangement or args.menu_appearance or args.update_fixture or args.login_item or args.agent_skill_fixture) or args.exercise or args.exercise_controls or args.sharing:
             gui_click('Refresh monitor')
             gui_ready('gui-refresh')
             # A background status refresh must not discard a pending layout choice
@@ -2329,6 +2686,14 @@ try:
                 owned_state = run('fullscreen', baseline['source1'])['after']
     if args.permissions:
         inspect_permissions()
+    if args.menu_appearance:
+        gui_inspect_menu_appearance()
+    if args.update_fixture:
+        gui_inspect_update()
+    if args.login_item:
+        gui_inspect_login_item()
+    if args.agent_skill_fixture:
+        gui_inspect_agent_skill()
     if args.exercise_arrangement:
         exercise_arrangement()
     if args.exercise_controls:
@@ -2358,6 +2723,9 @@ except Exception as error:
     import traceback
     (output / 'failure-traceback.txt').write_text(traceback.format_exc())
 finally:
+    if update_server is not None:
+        update_server.shutdown()
+        update_server.server_close()
     if baseline is not None and kvm_local_safe:
         try:
             final = read_state('status')
@@ -2394,7 +2762,7 @@ finally:
             summary['layoutUSBPreferenceRestoreError'] = str(error)
     if cua:
         try:
-            if gui_owned and owns_gui_process():
+            if gui_owned and gui_window is not None and owns_gui_process():
                 # Quit behind an active sheet can return an AX receipt without
                 # exiting. Dismiss only our recognized machine editor first.
                 gui_dismiss_machine_editor('gui-quit-editor-cleanup')
@@ -2420,6 +2788,65 @@ finally:
                 cua.close()
             except Exception as error:
                 summary['guiSessionCleanupError'] = str(error)
+                summary['passed'] = False
+    if args.update_fixture and summary.get('guiProcessExited') and summary.get('updateFixture', {}).get('signedDownloadReady'):
+        # Sparkle's staged automatic update installs when this owned fixture
+        # quits, or --install-update drives its explicit dialog. Prove the
+        # replacement on disk without touching the real installed app.
+        installed = output / 'update-fixture/installed/MSI Screen.app'
+        expected = (root / 'VERSION').read_text().strip()
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                version = plistlib.loads((installed / 'Contents/Info.plist').read_bytes())['CFBundleVersion']
+            except (OSError, KeyError, plistlib.InvalidFileException):
+                version = None  # The installer can briefly replace the bundle.
+            if version == expected:
+                break
+            print(json.dumps({'action': ['wait-update-install-on-quit'], 'observedVersion': version}), flush=True)
+            time.sleep(1)
+        else:
+            summary['passed'] = False
+            summary['updateInstallError'] = 'Staged update did not replace the isolated app after Quit'
+        if version == expected:
+            signature = subprocess.run(['codesign', '--verify', '--deep', '--strict', str(installed)], capture_output=True, text=True)
+            summary['updateFixture'].update(installed=True, installedOnQuit=not args.install_update,
+                                            installedViaDialog=args.install_update, signatureValid=signature.returncode == 0)
+            if signature.returncode:
+                summary['passed'] = False
+                summary['updateInstallError'] = signature.stderr
+            else:
+                try:
+                    release = output / 'update-fixture/release/MSI Screen.app'
+                    artifacts = ['Contents/MacOS/MSIScreenMenu', 'Contents/MacOS/msi-screen',
+                                 'Contents/Resources/AgentSkills/msi-screen-control/SKILL.md']
+                    hashes = {}
+                    for relative in artifacts:
+                        hashes[relative] = hashlib.sha256((installed / relative).read_bytes()).hexdigest()
+                        assert hashes[relative] == hashlib.sha256((release / relative).read_bytes()).hexdigest(), 'Installed artifact differs from the signed release: ' + relative
+                    summary['updateFixture']['installedArtifactHashes'] = hashes
+                    gui_relaunch_updated_fixture(update_bundle_id)
+                except Exception as error:
+                    summary['passed'] = False
+                    summary['updateRelaunchError'] = str(error)
+    if args.update_fixture:
+        if update_server:
+            update_server.shutdown()
+            update_server.server_close()
+        fixture_app = output / 'update-fixture/installed/MSI Screen.app'
+        if fixture_app.exists():
+            unregistered = subprocess.run(['/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister',
+                                           '-u', str(fixture_app)], capture_output=True, text=True)
+            summary['updateFixtureUnregistered'] = unregistered.returncode == 0
+            if unregistered.returncode:
+                summary['passed'] = False
+    if args.agent_skill_fixture:
+        fixture_app = output / 'agent-skill-fixture/MSI Screen.app'
+        if fixture_app.exists():
+            unregistered = subprocess.run(['/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister',
+                                           '-u', str(fixture_app)], capture_output=True, text=True)
+            summary['skillFixtureUnregistered'] = unregistered.returncode == 0
+            if unregistered.returncode:
                 summary['passed'] = False
     (output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     print(json.dumps({'summary': summary, 'evidence': str(output)}, indent=2), flush=True)

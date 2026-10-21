@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "validValues": [
+    "{\"kind\":\"integer\",\"value\":-9223372036854775808}",
+    "{\"kind\":\"boolean\",\"value\":false}",
+    "{\"kind\":\"choice\",\"value\":\"vendor.input-9\"}",
+    "{\"kind\":\"layout\",\"value\":{\"templateID\":\"wide\",\"slots\":{\"main\":\"vendor.input-9\"},\"options\":{}}}"
+  ],
+  "invalidValues": [
+    "{\"kind\":\"integer\",\"value\":1.0}",
+    "{\"kind\":\"integer\",\"value\":1e0}",
+    "{\"kind\":\"boolean\",\"value\":false,\"v\\u0061lue\":true}",
+    "{\"kind\":\"layout\",\"value\":{\"templateID\":\"wide\",\"slots\":{},\"options\":{},\"private\":\"not allowed\"}}"
+  ]
+}

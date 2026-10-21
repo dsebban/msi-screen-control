@@ -72,7 +72,8 @@ final class ScreenTests: XCTestCase {
         var ignoreWrites = false
         var onlineVideoCount: Int? = 1
         var coldUSBVideo = false
-        func query(_ code: String) throws -> [UInt8] { values[code]! }
+        var queries: [String] = []
+        func query(_ code: String) throws -> [UInt8] { queries.append(code); return values[code]! }
         func writeSetting(_ setting: MonitorSetting, value: Int) throws {
             XCTFail("Layout operations must not write individual settings")
         }
@@ -94,6 +95,25 @@ final class ScreenTests: XCTestCase {
         let transport = Transport()
         transport.values["00140"] = [48,48,161]
         XCTAssertThrowsError(try ScreenController(transport: transport).apply(initial, from: initial))
+        XCTAssertEqual(transport.writes, 0)
+    }
+
+    func testIdentityDiagnosticPreservesBinaryBytesWithoutReadingModelSpecificRegisters() throws {
+        let transport = Transport()
+        let report = try ScreenController(transport: transport).identity()
+        XCTAssertEqual(report.identityHex, "3030a0")
+        XCTAssertEqual(report.protocolVersion, "V20")
+        XCTAssertTrue(report.controlSupported)
+        XCTAssertEqual(transport.queries, ["00140", "00150"])
+        XCTAssertEqual(transport.writes, 0)
+        // An uninterpretable firmware response must remain lossless in the
+        // diagnostic instead of becoming a guessed model or replacement text.
+        transport.values["00150"] = [0xff, 0x00]
+        let unknown = try ScreenController(transport: transport).identity()
+        XCTAssertEqual(unknown.protocolHex, "ff00")
+        XCTAssertNil(unknown.protocolVersion)
+        XCTAssertFalse(unknown.controlSupported)
+        XCTAssertNil(unknown.matchedProfile)
         XCTAssertEqual(transport.writes, 0)
     }
 
