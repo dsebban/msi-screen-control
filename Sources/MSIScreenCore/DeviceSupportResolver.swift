@@ -61,9 +61,9 @@ public enum DeviceSupportResolver {
     /// Execution qualification and fresh live observations remain separate gates.
     public static func resolve(endpoint: DeviceEndpoint, snapshot: DeviceInventorySnapshot,
                                registry: SupportRegistrySnapshot) -> DeviceSupportResolution {
-        let matching = registry.bindings.filter { $0.enabled && $0.selector.physicalDomainID == endpoint.physicalDomainID }
+        let matching = registry.bindings.filter { $0.selector.physicalDomainID == endpoint.physicalDomainID }
         if matching.count > 1 { return .collision(candidates: matching.map(\.id).sorted()) }
-        if !matching.isEmpty { return .disabled(reason: "executionValidationPending") }
+        if let binding = matching.first { return .disabled(reason: binding.enabled ? "executionValidationPending" : "bindingDisabled") }
         if BuiltInControlDomainCatalog.isMSI(endpoint.identity) || BuiltInControlDomainCatalog.reserved(endpoint, in: snapshot) { return .builtInCandidate }
         return .unconfigured
     }

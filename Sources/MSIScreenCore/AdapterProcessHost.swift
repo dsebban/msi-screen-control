@@ -91,16 +91,18 @@ struct HostInvocation: Codable, Sendable {
     let supportHome: String
     let request: AdapterRequest
     let leaseNames: [String]
-    private enum CodingKeys: String, CodingKey { case schema, host, directory, supportHome, request, leaseNames }
-    init(host: AdapterHostIdentity, directory: String, supportHome: String, request: AdapterRequest, leaseNames: [String]) {
-        schema = 1; self.host = host; self.directory = directory; self.supportHome = supportHome; self.request = request; self.leaseNames = leaseNames
+    let fixture: DeviceSupportVerificationFixture.Reference?
+    private enum CodingKeys: String, CodingKey { case schema, host, directory, supportHome, request, leaseNames, fixture }
+    init(host: AdapterHostIdentity, directory: String, supportHome: String, request: AdapterRequest, leaseNames: [String], fixture: DeviceSupportVerificationFixture.Reference? = nil) {
+        schema = 1; self.host = host; self.directory = directory; self.supportHome = supportHome; self.request = request; self.leaseNames = leaseNames; self.fixture = fixture
     }
     init(from decoder: Decoder) throws {
-        try decoder.contractKeys(["schema", "host", "directory", "supportHome", "request", "leaseNames"]); let c = try decoder.container(keyedBy: CodingKeys.self)
+        try decoder.contractKeys(["schema", "host", "directory", "supportHome", "request", "leaseNames", "fixture"]); let c = try decoder.container(keyedBy: CodingKeys.self)
         schema = try c.decode(Int.self, forKey: .schema); host = try c.decode(AdapterHostIdentity.self, forKey: .host)
         directory = try c.decode(String.self, forKey: .directory); supportHome = try c.decode(String.self, forKey: .supportHome)
         request = try c.decode(AdapterRequest.self, forKey: .request)
         leaseNames = try c.decode([String].self, forKey: .leaseNames)
+        fixture = try c.decodeIfPresent(DeviceSupportVerificationFixture.Reference.self, forKey: .fixture)
         try requireContract(schema == 1 && directory.hasPrefix("/") && supportHome.hasPrefix("/") && leaseNames.count <= 128 && Set(leaseNames).count == leaseNames.count, "hostInvocation")
     }
 }
@@ -150,7 +152,11 @@ public enum AdapterProcessHost {
         if let failure = error as? DeviceAdapterFailure { return failure }
         let code: String
         switch error {
-        case DeviceContractError.invalid("hostBuildChanged"): code = "hostBuildChanged"
+        case DeviceContractError.invalid("hostBuildChanged"), DeviceContractError.invalid("hostIntegrityChanged"): code = "hostBuildChanged"
+        case DeviceContractError.invalid("hostSignatureChanged"), DeviceContractError.invalid("hostSignatureMismatch"): code = "hostSignatureChanged"
+        case DeviceContractError.invalid("hostPath"): code = "hostUnavailable"
+        case DeviceContractError.invalid(let reason) where ["unlistedIdentity", "absentEndpoint", "staleEndpoint", "ambiguousEndpoint", "inventoryIncomplete", "registryChanged", "expiredPlan"].contains(reason): code = reason
+        case SupportStorageError.revisionChanged: code = "registryChanged"
         case DeviceContractError.invalid("parentLost"): code = "parentLost"
         case DeviceContractError.invalid("adapterTimeout"): code = "adapterTimeout"
         case DeviceContractError.invalid("providerChanged"): code = "providerChanged"
@@ -241,17 +247,21 @@ public enum AdapterProcessHost {
         spec.inheritedDescriptors += [.init(source: live.reader, destination: liveFD), .init(source: pair.1, destination: helloFD)]
         let worker = Task { try await ProcessRunner.runStructured(spec, cancellationPolicy: .terminate) }
         return try await withTaskCancellationHandler {
+            var handshakeComplete = false
             do {
                 try await receiveHello(pair.0, expected: AdapterHello(request: request, executableDigest: expectedExecutableDigest),
                     deadline: min(request.deadlineUptimeMilliseconds, uptimeMilliseconds + 5000))
+                handshakeComplete = true
                 try Task.checkCancellation(); try await beforeRelease?(); try Task.checkCancellation()
                 try writeAll(Data([1]), descriptor: pair.0)
             } catch {
+                let rejected = handshakeComplete ? failure(error, dispatched: false)
+                    : DeviceAdapterFailure(code: Task.isCancelled ? "adapterCancelled" : "hostWorkerBuildMismatch", dispatched: false, cleanupConfirmed: true)
                 live.end()
                 let escalation = Task { try? await Task.sleep(nanoseconds: 1_000_000_000); if !Task.isCancelled { worker.cancel() } }
                 defer { escalation.cancel() }
                 let output = try await worker.value
-                throw DeviceAdapterFailure(code: Task.isCancelled ? "adapterCancelled" : "hostWorkerBuildMismatch", dispatched: false, cleanupConfirmed: output.cleanupConfirmed)
+                throw DeviceAdapterFailure(code: rejected.code, dispatched: false, cleanupConfirmed: rejected.cleanupConfirmed && output.cleanupConfirmed)
             }
             let output = try await worker.value
             return output
@@ -267,11 +277,27 @@ public enum AdapterProcessHost {
             input: try StrictJSON.canonical(invocation), scratchParent: URL(fileURLWithPath: invocation.directory).deletingLastPathComponent().appendingPathComponent("scratch"))
         spec.inheritedDescriptors = (lease?.descriptors ?? []).enumerated().map { .init(source: $0.element, destination: firstLeaseFD + Int32($0.offset)) }
         let output = try await runSupervised(specification: spec, request: invocation.request, expectedExecutableDigest: host.digest, live: live)
-        try host.validate()
-        if Task.isCancelled { throw DeviceAdapterFailure(code: "adapterCancelled", dispatched: invocation.request.operation == .apply, cleanupConfirmed: output.cleanupConfirmed) }
+        do { try host.validate() }
+        catch {
+            let rejected = failure(error, dispatched: invocation.request.operation == .apply)
+            throw DeviceAdapterFailure(code: rejected.code, dispatched: rejected.dispatched,
+                cleanupConfirmed: rejected.cleanupConfirmed && cleanupConfirmed(in: output))
+        }
+        if Task.isCancelled { throw DeviceAdapterFailure(code: "adapterCancelled", dispatched: invocation.request.operation == .apply, cleanupConfirmed: cleanupConfirmed(in: output)) }
         return try response(output, request: invocation.request)
     }
+    /// A decoded worker's negative cleanup evidence is conservative even when
+    /// its correlation or a later integrity check fails. It can never upgrade
+    /// the process primitive's own unconfirmed cleanup to confirmed.
+    static func cleanupConfirmed(in output: ProcessRunner.StructuredOutput) -> Bool {
+        guard output.cleanupConfirmed else { return false }
+        if let response = try? StrictJSON.decode(AdapterResponse.self, from: output.stdout), case .failed(let failure) = response.result {
+            return failure.cleanupConfirmed
+        }
+        return true
+    }
     static func response(_ output: ProcessRunner.StructuredOutput, request: AdapterRequest) throws -> AdapterResponse {
+        let cleanup = cleanupConfirmed(in: output)
         guard output.succeeded else {
             let code: String
             switch output.termination {
@@ -282,12 +308,12 @@ public enum AdapterProcessHost {
             case .signaled: code = "adapterSignal"
             case .exited: code = "adapterExit"
             }
-            throw DeviceAdapterFailure(code: code, dispatched: request.operation == .apply, cleanupConfirmed: output.cleanupConfirmed)
+            throw DeviceAdapterFailure(code: code, dispatched: request.operation == .apply, cleanupConfirmed: cleanup)
         }
         do {
             let response = try StrictJSON.decode(AdapterResponse.self, from: output.stdout)
             try response.validate(request: request); return response
-        } catch { throw DeviceAdapterFailure(code: "adapterProtocolMismatch", dispatched: request.operation == .apply, cleanupConfirmed: output.cleanupConfirmed) }
+        } catch { throw DeviceAdapterFailure(code: "adapterProtocolMismatch", dispatched: request.operation == .apply, cleanupConfirmed: cleanup) }
     }
 
     /// Public solely for the CLI's hidden early dispatch. There is no public
@@ -309,9 +335,14 @@ public enum AdapterProcessHost {
                     try writeAll(StrictJSON.canonical(AdapterResponse(request: invocation.request, result: .failed(failure))), descriptor: STDOUT_FILENO)
                 }
             } else {
-                try requireContract(arguments.count == 3, "internalArguments")
+                try requireContract(arguments.count == 3 || arguments.count == 6, "internalArguments")
+                var fixture: DeviceSupportVerificationFixture.Reference?
+                if arguments.count == 6 {
+                    guard let nonce = UUID(uuidString: arguments[4]) else { throw DeviceContractError.invalid("invalidFixtureReceipt") }
+                    fixture = .init(receiptPath: arguments[3], nonce: nonce, receiptDigest: arguments[5])
+                }
                 let request = try StrictJSON.decode(AdapterRequest.self, from: boundedInput())
-                do { try profileWorker(request: request, directory: arguments[1], supportHome: arguments[2]) }
+                do { try profileWorker(request: request, directory: arguments[1], supportHome: arguments[2], fixture: fixture) }
                 catch {
                     let failure = failure(error, dispatched: request.operation == .apply)
                     try writeAll(StrictJSON.canonical(AdapterResponse(request: request, result: .failed(failure))), descriptor: STDOUT_FILENO)
@@ -334,6 +365,12 @@ public enum AdapterProcessHost {
         try requireContract(content.digest == invocation.request.providerDigest, "providerDigestChanged")
         try SupportPackageInstaller.validateNative(content, directory: directory)
         try validatePayload(invocation.request.payload, content: content)
+        let fixture = try invocation.fixture.map { try DeviceSupportVerificationFixture(reference: $0) }
+        if let fixture {
+            try requireContract(invocation.supportHome == fixture.registry.home.path
+                && directory.url.deletingLastPathComponent().deletingLastPathComponent().path == fixture.registry.home.appendingPathComponent("invocations").path, "fixtureRootMismatch")
+            try fixture.checkedContent(content)
+        }
         let supportRegistry = try SupportRegistry(existingHome: URL(fileURLWithPath: invocation.supportHome))
         switch invocation.request.payload {
         case .apply(let plan, _, _): try DeviceContractAuthentication(key: supportRegistry.existingInstallationKey()).verify(plan)
@@ -345,7 +382,9 @@ public enum AdapterProcessHost {
         let executable: URL; let arguments: [String]; let digest: String
         switch content.manifest.backend {
         case .profile:
-            executable = URL(fileURLWithPath: current.path); arguments = ["support-worker", invocation.directory, invocation.supportHome]; digest = current.digest
+            executable = URL(fileURLWithPath: current.path)
+            arguments = ["support-worker", invocation.directory, invocation.supportHome] + (invocation.fixture.map { [$0.receiptPath, $0.nonce.uuidString, $0.receiptDigest] } ?? [])
+            digest = current.digest
         case .nativeAdapter(let path, _, _):
             executable = directory.url.appendingPathComponent(path); arguments = []; digest = SupportPackageContent.hash(content.files[path]!)
         }
@@ -369,9 +408,13 @@ public enum AdapterProcessHost {
         }
         defer { watcher.cancel(); live.end() }
         let output = try await task.value
-        guard try SupportPackageContent.read(directory) == content else { throw SupportStorageError.integrityChanged }
-        try SupportPackageInstaller.validateNative(content, directory: directory)
-        if uptimeMilliseconds >= request.deadlineUptimeMilliseconds { throw DeviceAdapterFailure(code: "adapterTimeout", dispatched: request.operation == .apply, cleanupConfirmed: output.cleanupConfirmed) }
+        do {
+            guard try SupportPackageContent.read(directory) == content else { throw SupportStorageError.integrityChanged }
+            try SupportPackageInstaller.validateNative(content, directory: directory)
+        } catch {
+            throw DeviceAdapterFailure(code: "integrityChangedDuringRun", dispatched: request.operation == .apply, cleanupConfirmed: cleanupConfirmed(in: output))
+        }
+        if uptimeMilliseconds >= request.deadlineUptimeMilliseconds { throw DeviceAdapterFailure(code: "adapterTimeout", dispatched: request.operation == .apply, cleanupConfirmed: cleanupConfirmed(in: output)) }
         let response = try response(output, request: request)
         try writeAll(StrictJSON.canonical(response), descriptor: STDOUT_FILENO)
     }
@@ -400,18 +443,23 @@ public enum AdapterProcessHost {
         }
         // Keyed inventory identity is irrelevant to physical revalidation here:
         // resolve the supplied exact attachment against current raw OS facts.
-        let graph = try MacUSBPeripheralReader.controlGraph(from: USBDeviceGraph.enumerateUSB())
-        let required = try DeviceResourceLock.controlRequest(endpoint, graph: graph, descriptor: content.manifest.descriptor)
-        let lease = try DeviceResourceLock(borrowing: required, names: invocation.leaseNames, firstDescriptor: firstLeaseFD)
+        let fixture = try invocation.fixture.map { try DeviceSupportVerificationFixture(reference: $0) }
+        let required = try fixture?.lockRequest(endpoint, descriptor: content.manifest.descriptor) ?? DeviceResourceLock.controlRequest(endpoint,
+            usbGraph: { try MacUSBPeripheralReader.controlGraph(from: USBDeviceGraph.enumerateUSB()) }, descriptor: content.manifest.descriptor)
+        let lease = try DeviceResourceLock(borrowing: required, names: invocation.leaseNames, firstDescriptor: firstLeaseFD,
+            directory: fixture?.directory.appendingPathComponent("leases"))
         let key = try registry.existingInstallationKey()
-        let reader = MacDeviceInventoryReader(identity: try DeviceInventoryIdentity(installationKey: key))
-        let current = try await reader.snapshot(), metadata = try registry.snapshot()
+        let current: DeviceInventorySnapshot
+        if let fixture { current = try fixture.snapshotSynchronously() }
+        else { current = try await MacDeviceInventoryReader(identity: DeviceInventoryIdentity(installationKey: key)).snapshot() }
+        let metadata = try registry.snapshot()
         let selected = try current.resolve(endpoint)
         let identity: DeviceContractIdentity
         switch invocation.request.payload {
         case .read(let expected, _, _): identity = expected
         case .apply(let plan, _, _):
-            try requireContract(plan.registryRevision == metadata.revision && Int64(Date().timeIntervalSince1970 * 1000) < plan.expiresAtMilliseconds, "registryChangedOrExpiredPlan")
+            try requireContract(plan.registryRevision == metadata.revision, "registryChanged")
+            try requireContract(Int64(Date().timeIntervalSince1970 * 1000) < plan.expiresAtMilliseconds, "expiredPlan")
             identity = plan.identity
         default: throw DeviceContractError.invalid("livePayloadRequired")
         }
@@ -419,8 +467,11 @@ public enum AdapterProcessHost {
         try requireContract(matching.count == 1 && matching[0].id == identity.bindingID && matching[0].digest == content.digest
             && matching[0].selector.id == endpoint.id && matching[0].selector.identity == endpoint.identity, "providerChanged")
         try checkLiveness(deadline: invocation.request.deadlineUptimeMilliseconds)
-        try DeviceSupportResolver.guardSelected(endpoint: selected, manifest: content.manifest, lease: lease,
-            snapshot: { current }, usbSource: { try USBDeviceGraph.enumerateUSB() })
+        if let fixture { try fixture.revalidate(selected, content: content) }
+        else {
+            try DeviceSupportResolver.guardSelected(endpoint: selected, manifest: content.manifest, lease: lease,
+                snapshot: { current }, usbSource: { try USBDeviceGraph.enumerateUSB() })
+        }
     }
     static func revalidatePhysical(_ endpoint: DeviceEndpoint) throws {
         switch endpoint.address {
@@ -434,7 +485,7 @@ public enum AdapterProcessHost {
         default: throw DeviceContractError.invalid("unsupportedControlEndpoint")
         }
     }
-    private static func profileWorker(request: AdapterRequest, directory path: String, supportHome: String) throws {
+    private static func profileWorker(request: AdapterRequest, directory path: String, supportHome: String, fixture reference: DeviceSupportVerificationFixture.Reference? = nil) throws {
         try request.validate()
         let current = try AdapterHostIdentity.capture(AdapterHostIdentity.currentExecutable())
         let directory = try SupportDirectory.root(URL(fileURLWithPath: path), create: false)
@@ -449,6 +500,11 @@ public enum AdapterProcessHost {
         }
         try exchangeHello(request: request, executableDigest: current.digest)
         let result: AdapterResult
+        if let reference {
+            let fixture = try DeviceSupportVerificationFixture(reference: reference)
+            try requireContract(fixture.registry.home.path == supportHome, "fixtureRootMismatch")
+            result = try fixture.profileResult(request: request, content: content)
+        } else {
         switch request.payload {
         case .selfTest:
             try HIDFeatureProfileExecutor.selfTest(profile: profile, descriptor: content.manifest.descriptor); result = .selfTest
@@ -466,6 +522,7 @@ public enum AdapterProcessHost {
             let executor = try HIDFeatureProfileExecutor(profile: profile, descriptor: content.manifest.descriptor, identity: plan.identity, transport: transport)
             result = .apply(try executor.apply(plan.operation, expected: expected))
             withExtendedLifetime(executor) {}
+        }
         }
         try checkLiveness(deadline: request.deadlineUptimeMilliseconds)
         let after = try SupportPackageContent.read(directory)

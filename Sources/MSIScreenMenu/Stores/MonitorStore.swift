@@ -46,6 +46,17 @@ final class MonitorStore: ObservableObject {
     @Published var settingsDraft: [String: Int] = [:]
     @Published private(set) var hasSavedSetup = UserDefaults.standard.data(forKey: "savedLayout") != nil
     var showingSettings = false
+    // Configured once by the delegate; shared by buttons and Rapoo RPC entry points.
+    var externalMutationActive: () -> Bool = { false }
+    var usbUpstreamMachine: () -> MachineDefinition? = { nil }
+    var hasActiveOperation: Bool { busy || sideWheelChangeBusy || topButtonChangeBusy || rapooDetailsBusy || popDetailsBusy || pointerProbeBusy || peripheralsBusy }
+    private func permitMutation() -> Bool {
+        guard !externalMutationActive() else {
+            error = "Another device operation is active. Wait for it to finish."
+            return false
+        }
+        return true
+    }
 
     private let queue = DispatchQueue(label: "MSIScreen.usb", qos: .userInitiated)
     private var externalRefreshPending = false
@@ -65,7 +76,8 @@ final class MonitorStore: ObservableObject {
     }
 
     func layoutApplication(machines: [MachineDefinition], followUSB: Bool) -> LayoutApplication? {
-        target.map { LayoutApplication(target: $0, machines: machines, followUSB: followUSB) }
+        target.map { LayoutApplication(target: $0, machines: machines, followUSB: followUSB,
+                                       usbUpstreamMachineID: usbUpstreamMachine()?.id) }
     }
 
     func canApply(machines: [MachineDefinition], followUSB: Bool) -> Bool {
@@ -116,6 +128,7 @@ final class MonitorStore: ObservableObject {
     }
 
     func apply(machines: [MachineDefinition], followUSB: Bool) {
+        guard permitMutation() else { return }
         guard let before = state,
               let application = layoutApplication(machines: machines, followUSB: followUSB),
               canApply(machines: machines, followUSB: followUSB) else { return }
@@ -138,7 +151,7 @@ final class MonitorStore: ObservableObject {
     }
 
     func canRoute(_ machine: MachineDefinition, to route: MachineRoute, followUSB: Bool) -> Bool {
-        guard !busy else { return false }
+        guard !busy, machine.input != nil else { return false }
         if followsUSB(machine, route: route, enabled: followUSB) {
             return kvm != nil && (!needsRefresh || (localMonitorReadBlocked && state == nil))
         }
@@ -147,10 +160,11 @@ final class MonitorStore: ObservableObject {
 
     private func followsUSB(_ machine: MachineDefinition, route: MachineRoute, enabled: Bool) -> Bool {
         enabled && route == .fullscreen &&
-            ((machine.isLocal && machine.input == .usbc) || machine.platform == .linux)
+            machine.followsFullscreenUSB(upstreamMachineID: usbUpstreamMachine()?.id)
     }
 
     func route(_ machine: MachineDefinition, to route: MachineRoute, followUSB: Bool = false) {
+        guard permitMutation() else { return }
         guard canRoute(machine, to: route, followUSB: followUSB) else { return }
         if followsUSB(machine, route: route, enabled: followUSB) {
             focus(machine)
@@ -177,7 +191,8 @@ final class MonitorStore: ObservableObject {
 
     private func applyPreservingUSB(_ target: ScreenState, from before: ScreenState,
                                     expectedMachine: MachineDefinition? = nil) {
-        guard !busy, let expectedUSB = kvm?.route else { return }
+        guard permitMutation(), !busy, let expectedUSB = kvm?.route else { return }
+        let expectedUpstream = usbUpstreamMachine()
         busy = true
         isApplying = true
         kvmBusy = true
@@ -189,6 +204,9 @@ final class MonitorStore: ObservableObject {
         Task {
             do {
                 let registry = try MachineRegistryStore().load()
+                guard registry.usbUpstreamMachine == expectedUpstream else {
+                    throw ScreenError.message("USB-B assignment changed. Refresh before switching.")
+                }
                 if let expectedMachine,
                    try registry.machine(id: expectedMachine.id) != expectedMachine {
                     throw ScreenError.message("Machine assignment changed. Refresh before switching.")
@@ -218,7 +236,9 @@ final class MonitorStore: ObservableObject {
     }
 
     private func focus(_ machine: MachineDefinition) {
+        guard permitMutation(), !busy, let input = machine.input else { return }
         let expectedUSB = kvm?.route
+        let expectedUpstream = usbUpstreamMachine()
         let expectedLayout = state
         busy = true
         isApplying = true
@@ -226,13 +246,14 @@ final class MonitorStore: ObservableObject {
         error = nil
         kvmError = nil
         invalidatePeripherals()
-        pendingTarget = state.map { ScreenController.fullscreenTarget(from: $0, input: machine.input) }
+        pendingTarget = state.map { ScreenController.fullscreenTarget(from: $0, input: input) }
         message = "Switching \(machine.name) · picture, then keyboard & mouse…"
         kvmMessage = "Switching picture and USB together…"
         Task {
             do {
                 let registry = try MachineRegistryStore().load()
-                guard try registry.machine(id: machine.id) == machine else {
+                guard try registry.machine(id: machine.id) == machine,
+                      registry.usbUpstreamMachine == expectedUpstream else {
                     throw ScreenError.message("Machine assignment changed. Refresh before switching.")
                 }
                 let coordinator = try MachineFocusCoordinator(registry: registry)
@@ -274,6 +295,7 @@ final class MonitorStore: ObservableObject {
     }
 
     func restoreSetup() {
+        guard permitMutation() else { return }
         guard !busy, !needsRefresh, let before = state,
               let data = UserDefaults.standard.data(forKey: "savedLayout") else { return }
         do {
@@ -327,7 +349,8 @@ final class MonitorStore: ObservableObject {
         }
     }
 
-    func setKVM(_ route: KVMRoute, expectedMachines: [MachineDefinition]) {
+    func setKVM(_ route: KVMRoute, expectedMachines: [MachineDefinition], expectedUpstreamMachineID: String?) {
+        guard permitMutation() else { return }
         guard !busy, let before = kvm else { return }
         busy = true
         kvmBusy = true
@@ -338,7 +361,8 @@ final class MonitorStore: ObservableObject {
             var refreshLocal = false
             do {
                 let registry = try MachineRegistryStore().load()
-                guard registry.machines == expectedMachines else {
+                guard registry.machines == expectedMachines,
+                      registry.usbUpstreamMachine?.id == expectedUpstreamMachineID else {
                     throw ScreenError.message("Machine assignments changed. Refresh before switching USB.")
                 }
                 let coordinator = try KVMCoordinator(registry: registry)
@@ -467,7 +491,7 @@ final class MonitorStore: ObservableObject {
     /// before this Mac has successfully reserved its corresponding shortcuts.
     func setSideWheel(_ preset: RapooSideWheelPreset,
                       expected: [RapooWheelMapping]) async throws -> RapooWheelChangeResult {
-        guard !busy, !rapooDetailsBusy, !sideWheelChangeBusy, !pointerProbeBusy else {
+        guard permitMutation(), !busy, !rapooDetailsBusy, !sideWheelChangeBusy, !pointerProbeBusy else {
             throw ScreenError.message("Another device operation is active. Wait for it to finish.")
         }
         guard kvm?.controlHost != .upstream else {
@@ -514,7 +538,7 @@ final class MonitorStore: ObservableObject {
 
     /// Changes only this Mac's interpretation of the onboard F18/F19 mappings.
     func setWheelHostAction(_ action: RapooWheelHostAction) throws {
-        guard !sideWheelChangeBusy else {
+        guard permitMutation(), !busy, !sideWheelChangeBusy, !topButtonChangeBusy else {
             throw ScreenError.message("Wait for the mouse mapping change to finish.")
         }
         try AppSwitchController.shared.start(mode: action)
@@ -525,7 +549,7 @@ final class MonitorStore: ObservableObject {
 
     func setTopButton(_ preset: RapooTopButtonPreset, expectedRecordHex: String,
                       bundleIdentifier: String?) async throws -> RapooButtonChangeResult {
-        guard !busy, !rapooDetailsBusy, !pointerProbeBusy else {
+        guard permitMutation(), !busy, !rapooDetailsBusy, !pointerProbeBusy else {
             throw ScreenError.message("Another device operation is active. Wait for it to finish.")
         }
         guard kvm?.controlHost != .upstream else {
@@ -618,7 +642,8 @@ final class MonitorStore: ObservableObject {
                     guard let id = expected.machineID, let host = try registry.machine(id: id).host else {
                         throw ScreenError.message("The USB host has no SSH connection.")
                     }
-                    details = try await client.remoteDetails(host: host, for: paired)
+                    let transport = try registry.machine(id: id).sshTransport
+                    details = try await client.remoteDetails(host: host, transport: transport, for: paired)
                 }
                 if generation == peripheralGeneration, expected == kvm,
                    try MachineRegistryStore().load() == registry {
@@ -688,7 +713,8 @@ final class MonitorStore: ObservableObject {
                     guard let id = expected.machineID, let host = try registry.machine(id: id).host else {
                         throw ScreenError.message("The USB host has no SSH connection.")
                     }
-                    snapshot = try await USBPeripheralClient().remote(host: host)
+                    let transport = try registry.machine(id: id).sshTransport
+                    snapshot = try await USBPeripheralClient().remote(host: host, transport: transport)
                 }
                 guard generation == peripheralGeneration, expected == kvm,
                       try MachineRegistryStore().load() == registry else {
@@ -719,6 +745,7 @@ final class MonitorStore: ObservableObject {
     }
 
     func applySetting(_ setting: MonitorSetting) {
+        guard permitMutation() else { return }
         guard !busy, !needsRefresh, let before = settings, let value = settingsDraft[setting.rawValue] else { return }
         isApplying = true
         performSettings(message: "Applying \(setting.title)…") {

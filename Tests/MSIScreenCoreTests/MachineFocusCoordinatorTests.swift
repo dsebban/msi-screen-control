@@ -127,6 +127,26 @@ final class MachineFocusCoordinatorTests: XCTestCase {
         XCTAssertFalse(world.events.contains("announce"))
     }
 
+    func testVideoOnlyAndUnassignedFocusRejectBeforeReadingOrWritingEndpoints() async {
+        let world = World()
+        var unassigned = Self.linux
+        unassigned.input = nil
+        let deck = MachineDefinition(id: "deck", name: "Steam Deck", platform: .linux,
+                                     input: .dp, host: nil, access: .videoOnly)
+        let registry = MachineRegistry(machines: [Self.mac, unassigned, deck])
+        let coordinator = MachineFocusCoordinator(registry: registry, kvm: world.kvmCoordinator(),
+                                                  video: World.Video(world), checkRegistry: {})
+        for id in [unassigned.id, deck.id] {
+            do {
+                _ = try await coordinator.focus(machineID: id)
+                XCTFail("Focus must reject a machine without video or USB control")
+            } catch {}
+        }
+        XCTAssertTrue(world.events.isEmpty)
+        XCTAssertTrue(world.writes.isEmpty)
+        XCTAssertEqual(world.videoCalls, 0)
+    }
+
     func testLinuxFocusAppliesPreservedLayoutBeforeGuardedUSBHandoff() async throws {
         let world = World()
         let result = try await world.coordinator().focus(machineID: "linux",

@@ -83,7 +83,7 @@ final class DeviceAdapterTests: XCTestCase {
             let expected = ["badHello": "hostWorkerBuildMismatch", "wrongRequest": "adapterProtocolMismatch", "unknownKey": "adapterProtocolMismatch",
                 "malformed": "adapterProtocolMismatch", "nonzero": "adapterExit", "noise": "adapterOutputOverflow", "hold": "adapterTimeout", "mutate": "integrityChangedDuringRun"]
             do {
-                _ = try await DeviceAdapterRunner(registry: registry, host: host).invoke(content: content, payload: .selfTest, timeout: mode == "hold" ? 0.3 : 3)
+                _ = try await DeviceAdapterRunner(registry: registry, host: host).invoke(content: content, payload: .selfTest, timeout: mode == "hold" ? 0.3 : 5)
                 XCTFail("Accepted \(mode)")
             } catch {
                 XCTAssertEqual((error as? DeviceAdapterFailure)?.code, expected[mode]); XCTAssertEqual((error as? DeviceAdapterFailure)?.cleanupConfirmed, true)
@@ -93,6 +93,47 @@ final class DeviceAdapterTests: XCTestCase {
             XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: registry.home.appendingPathComponent("invocations").path).isEmpty)
         }
     }
+    func testPreReleaseRevalidationKeepsConcreteReasonAndNeverSendsGo() async throws {
+        let root = try u3Root(), executable = try Data(contentsOf: await AdapterFixture.build.value.executable)
+        for code in ["providerChanged", "unlistedIdentity", "absentEndpoint", "staleEndpoint", "registryChanged", "expiredPlan"] {
+            let marker = root.appendingPathComponent(code), directory = try SupportDirectory.root(root.appendingPathComponent("copy-" + code))
+            let content = try U3Fixture.content(native: executable, marker: marker.path); try content.copy(to: directory)
+            let request = AdapterRequest(providerDigest: content.digest, payload: .selfTest, timeout: 5)
+            let spec = ProcessRunner.Specification(executable: directory.url.appendingPathComponent("adapter"), arguments: [], timeout: 5,
+                input: try StrictJSON.canonical(request))
+            do {
+                _ = try await AdapterProcessHost.runSupervised(specification: spec, request: request,
+                    expectedExecutableDigest: SupportPackageContent.hash(executable), live: AdapterLiveness()) {
+                        throw DeviceContractError.invalid(code)
+                    }
+                XCTFail("Pre-release rejection accepted")
+            } catch {
+                let failure = try XCTUnwrap(error as? DeviceAdapterFailure)
+                XCTAssertEqual(failure.code, code); XCTAssertFalse(failure.dispatched); XCTAssertTrue(failure.cleanupConfirmed)
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "Worker marker is after Go; revalidation must reject before it")
+        }
+    }
+
+    func testActualNegativeCleanupSurvivesPostRunIntegrityAndCorrelationFailure() async throws {
+        let root = try u3Root(), host = try U3Fixture.host(), executable = try Data(contentsOf: await AdapterFixture.build.value.executable)
+        for mode in ["cleanupFalseMutation", "cleanupFalseCorrelation"] {
+            let registry = try SupportRegistry(home: root.appendingPathComponent(mode)), marker = root.appendingPathComponent(mode + ".marker")
+            let content = try U3Fixture.content(native: executable, mode: mode, marker: marker.path)
+            do {
+                _ = try await DeviceAdapterRunner(registry: registry, host: host).invoke(content: content, payload: .selfTest, timeout: 5)
+                XCTFail("Negative cleanup was accepted")
+            } catch {
+                let failure = try XCTUnwrap(error as? DeviceAdapterFailure)
+                XCTAssertEqual(failure.code, mode == "cleanupFalseMutation" ? "integrityChangedDuringRun" : "adapterProtocolMismatch")
+                XCTAssertFalse(failure.cleanupConfirmed); XCTAssertFalse(failure.dispatched)
+            }
+            let retained = try FileManager.default.contentsOfDirectory(atPath: registry.home.appendingPathComponent("invocations").path)
+            XCTAssertEqual(retained.count, 1, "Unconfirmed cleanup must retain the exact invocation state, never remove it or retry")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        }
+    }
+
     func testBothActualWorkersRetainOnlyBorrowedDescriptionAfterParentClosesAndExitOnParentLoss() async throws {
         let root = try u3Root(), artifact = try await AdapterFixture.build.value
         for native in [false, true] {
@@ -170,6 +211,62 @@ final class DeviceAdapterTests: XCTestCase {
         XCTAssertNotNil(owned.descriptor(forLegacy: "controller.lock")); XCTAssertNotNil(owned.descriptor(forLegacy: "rapoo.lock"))
     }
 
+    func testProductionExperimentalTargetRefusesQualificationPendingBeforeAnyOperationalDispatch() async throws {
+        struct FixedInventory: DeviceInventoryClient {
+            let value: DeviceInventorySnapshot
+            func snapshot() async throws -> DeviceInventorySnapshot { value }
+        }
+        let root = try u3Root(), registry = try SupportRegistry(home: root.appendingPathComponent("support")), helper = DeviceInventoryTests()
+        let hid = HIDDeviceNode(id: 30, usbDeviceID: nil, interfaceID: nil, interfaceNumber: nil, transport: .bluetooth,
+            vendor: 1, product: 2, name: "fixture", serial: "durable", usages: [DeviceUsage(page: 1, usage: 5)])
+        let snapshot = try helper.build([], [], [hid], key: registry.inventoryIdentity(), usbOutcome: .failed(code: .unavailable, message: "private diagnostic"))
+        let endpoint = try helper.endpoint(snapshot, kind: .hid), original = try U3Fixture.content()
+        var files = original.files, object = try JSONSerialization.jsonObject(with: original.files["manifest.json"]!) as! [String: Any]
+        object["selectors"] = [["transport": "bluetooth", "vendorID": 1, "productID": 2, "usages": [["page": 1, "usage": 5]]]]
+        files["manifest.json"] = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        let content = SupportPackageContent(files: files, manifest: try StrictJSON.decode(SupportManifest.self, from: files["manifest.json"]!), digest: SupportPackageContent.digest(files))
+        let source = try SupportDirectory.root(root.appendingPathComponent("source")); try content.copy(to: source)
+        let installer = SupportPackageInstaller(registry: registry), staged = try installer.stageInactive(source: source.url, expectedDigest: content.digest, expectedRevision: 0)
+        let selector = try DeviceEndpoint(kind: endpoint.kind, id: endpoint.id, identity: endpoint.identity, physicalDomainID: endpoint.physicalDomainID, incarnationID: endpoint.incarnationID, address: nil)
+        let binding = try SupportBinding(id: "fixture", selector: selector, packageID: content.manifest.id, digest: content.digest, enabled: true)
+        do {
+            let lock = try registry.root.lock("registry.lock"); defer { withExtendedLifetime(lock) {} }
+            _ = try registry.compareAndSwap(expectedRevision: staged.revision, packages: staged.packages, bindings: [binding])
+        }
+        XCTAssertFalse(installer.executionReady)
+        do {
+            _ = try await DeviceControlCoordinator.selectedTarget(deviceID: endpoint.id, registry: registry, reader: FixedInventory(value: snapshot), hostPin: .success(U3Fixture.host()))
+            XCTFail("Production returned an operational target while qualification remains pending; no target closure was invoked")
+        } catch { XCTAssertEqual(error as? DeviceContractError, .invalid("runtimeQualificationPending")) }
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: registry.home.appendingPathComponent("invocations").path).isEmpty)
+    }
+    func testSelectedRuntimeResourceRequestsIgnoreUnrelatedPartialUSBBUTRequireUSBAncestry() throws {
+        let root = try u3Root(), helper = DeviceInventoryTests()
+        let partial = InventorySourceSlice([helper.usb()], outcome: InventorySourceOutcome.failed(code: .unavailable, message: "private USB diagnostic"))
+        let hid = HIDDeviceNode(id: 30, usbDeviceID: nil, interfaceID: nil, interfaceNumber: nil, transport: .bluetooth,
+            vendor: 1, product: 2, name: "fixture", serial: "serial", usages: [DeviceUsage(page: 1, usage: 5)])
+        let snapshot = try helper.build([], [], [hid], usbOutcome: partial.outcome), endpoint = try helper.endpoint(snapshot, kind: .hid)
+        var calls = 0
+        func graph() throws -> USBDeviceGraph { calls += 1; return try MacUSBPeripheralReader.controlGraph(from: partial) }
+        let request = try DeviceResourceLock.controlRequest(endpoint, usbGraph: graph, descriptor: U3Fixture.descriptor())
+        let lease = try DeviceResourceLock(request, directory: root)
+        try DeviceSupportResolver.guardSelected(endpoint: endpoint, manifest: {
+            let content = try U3Fixture.content()
+            var object = try JSONSerialization.jsonObject(with: content.files["manifest.json"]!) as! [String: Any]
+            object["selectors"] = [["transport": "bluetooth", "vendorID": 1, "productID": 2, "usages": [["page": 1, "usage": 5]]]]
+            return try StrictJSON.decode(SupportManifest.self, from: JSONSerialization.data(withJSONObject: object))
+        }(), lease: lease, snapshot: { snapshot }, usbSource: { calls += 1; return partial })
+        XCTAssertEqual(calls, 0); XCTAssertTrue(request.controller); XCTAssertTrue(request.rapoo)
+        let usb = try helper.build([], [helper.usb()], [helper.hid(31, usage: 5)]), usbEndpoint = try helper.endpoint(usb, kind: .hid)
+        XCTAssertThrowsError(try DeviceResourceLock.controlRequest(usbEndpoint, usbGraph: graph, descriptor: U3Fixture.descriptor())) {
+            XCTAssertEqual($0 as? DeviceContractError, .invalid("usbInventoryIncomplete"))
+        }
+        XCTAssertEqual(calls, 1)
+        XCTAssertThrowsError(try DeviceResourceLock.controlRequest(usbEndpoint, usbGraph: { try USBDeviceGraph(devices: []) }, descriptor: U3Fixture.descriptor())) {
+            XCTAssertEqual($0 as? DeviceContractError, .invalid("absentEndpoint"))
+        }
+        withExtendedLifetime(lease) {}
+    }
     func testProfileWorkerFailureIsCorrelatedAndFailedValidationCannotActivate() async throws {
         let root = try u3Root(), registry = try SupportRegistry(home: root.appendingPathComponent("support"))
         let original = try U3Fixture.content()

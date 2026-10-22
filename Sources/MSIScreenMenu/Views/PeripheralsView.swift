@@ -8,10 +8,14 @@ struct PeripheralsView: View {
     @ObservedObject var store: MonitorStore
     @ObservedObject private var appSwitch = AppSwitchController.shared
     @State private var hostActionError: String?
+    @State private var receiverRefreshPending = false
     let usbHostName: String
     let machines: [MachineDefinition]
+    let upstreamMachineID: String?
     let configurationError: String?
     let controlsBusy: Bool
+    @ObservedObject var inventory: DeviceInventoryStore
+    @ObservedObject var deviceControl: DeviceControlStore
 
     private let mouseTint = Color(red: 0.35, green: 0.64, blue: 1)
     private let keyboardTint = Color(red: 0.80, green: 0.57, blue: 1)
@@ -32,15 +36,39 @@ struct PeripheralsView: View {
                 }
                 Spacer(minLength: 4)
             }
-            PrivacyStatusView()
-            USBHostControls(store: store, machines: machines, configurationError: configurationError,
+            USBHostControls(store: store, machines: machines, upstreamMachineID: upstreamMachineID,
+                            configurationError: configurationError,
                             controlsBusy: controlsBusy, showReceiverSummary: false)
+            DetectedPeripheralsView(inventory: inventory, control: deviceControl)
+            if receiverIsPresent(.rapoo) {
+                DisclosureGroup("Rapoo mouse controls") { mouseCard.disabled(controlsBusy) }
+                    .accessibilityIdentifier("rapoo-controls")
+            }
+            if receiverIsPresent(.bolt), let name = popKeyboardName {
+                DisclosureGroup("\(name) controls") { keyboardCard.disabled(controlsBusy) }
+                    .accessibilityIdentifier("pop-controls")
+            }
+            // Native controller discovery also recognizes alternate pairing modes
+            // that have no generic game-controller usage in the passive HID list.
             GameControllersView()
-            mouseCard
-            keyboardCard
+            DisclosureGroup("Privacy & permissions") { PrivacyStatusView() }
         }
+        .onChange(of: inventory.snapshot?.devices.flatMap(\.endpoints).map { "\($0.id):\($0.incarnationID)" }) { _ in
+            // Coalesce topology changes while an operation owns the device.
+            // This refresh reads receiver metadata; it never edits a draft.
+            receiverRefreshPending = true
+            refreshReceiversWhenIdle()
+        }
+        .onChange(of: store.hasActiveOperation) { _ in refreshReceiversWhenIdle() }
+        .onChange(of: controlsBusy) { _ in refreshReceiversWhenIdle() }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("peripherals-screen")
+    }
+
+    private func refreshReceiversWhenIdle() {
+        guard receiverRefreshPending, !store.hasActiveOperation, !controlsBusy else { return }
+        receiverRefreshPending = false
+        if store.kvm?.controlHost == .local { store.refreshPeripherals() }
     }
 
     private var hostDescription: String {
@@ -51,7 +79,7 @@ struct PeripheralsView: View {
     private var mouseCard: some View {
         let receiver = receiver(.rapoo)
         return VStack(alignment: .leading, spacing: 10) {
-            deviceHeader("MT760 Pro", subtitle: "Rapoo · your configured mouse",
+            deviceHeader("Rapoo mouse", subtitle: "Detected NearLink receiver · device controls",
                          symbol: "computermouse", tint: mouseTint)
             statusRow("Receiver", value: connectionDescription(receiver),
                       color: connectionColor(receiver), id: "rapoo-detail-connection")
@@ -348,7 +376,7 @@ struct PeripheralsView: View {
     private var keyboardCard: some View {
         let receiver = receiver(.bolt)
         return VStack(alignment: .leading, spacing: 10) {
-            deviceHeader("POP Keys", subtitle: "Logitech · Bolt receiver",
+            deviceHeader(popKeyboardName ?? "Keyboard", subtitle: "Observed Bolt receiver pairing",
                          symbol: "keyboard", tint: keyboardTint)
             statusRow("Receiver", value: connectionDescription(receiver),
                       color: connectionColor(receiver), id: "pop-detail-connection")
@@ -685,6 +713,23 @@ struct PeripheralsView: View {
             Text("Stored slots can refer to the same keyboard. A missing reply may mean it is asleep.")
                 .font(.system(size: 10)).foregroundStyle(.secondary)
         }
+    }
+
+    private var popKeyboardName: String? {
+        receiver(.bolt)?.pairedDevices.first {
+            $0.kind == .keyboard && ["POP Keys", "Logi POP Keys"].contains($0.name ?? "")
+        }?.name
+    }
+
+    private func receiverIsPresent(_ kind: USBReceiverKind) -> Bool {
+        guard let observed = receiver(kind), observed.connection != .notDetected else { return false }
+        // Remote observations remain explicitly scoped to the checked USB host.
+        if store.kvm?.controlHost != .local { return true }
+        let vendor: UInt32 = kind == .bolt ? 0x046d : 0x24ae
+        let product: UInt32 = kind == .bolt ? 0xc548 : 0x186a
+        return inventory.snapshot?.devices.flatMap(\.endpoints).contains {
+            $0.identity.vendorID == vendor && $0.identity.productID == product
+        } == true
     }
 
     private func receiver(_ kind: USBReceiverKind) -> USBReceiverSnapshot? {

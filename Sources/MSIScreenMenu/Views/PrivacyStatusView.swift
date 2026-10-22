@@ -46,6 +46,9 @@ struct PrivacyStatusView: View {
                         .font(.caption2).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                Text("These checks describe this caller only. They do not identify macOS’s responsible launch client or grant access to a CLI/adapter. Native adapters are unconfined user code; execution policy and device access can fail independently. Experimental execution remains refused until launch-client and platform qualification closes.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("experimental-permission-limit")
                 DisclosureGroup("Identity details") {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(snapshot.appPath)

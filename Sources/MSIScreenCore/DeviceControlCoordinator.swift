@@ -288,6 +288,10 @@ extension DeviceControlCoordinator {
             }
         }
         guard bindings.count == 1, let binding = bindings.first else { throw DeviceContractError.invalid(bindings.isEmpty ? "unconfiguredDevice" : "providerCollision") }
+        // Qualification gates apply to every production experimental operation,
+        // including Read, before constructing guards or backend closures. Built-in
+        // selection above and internal owned software transports keep their owners.
+        try requireContract(SupportPackageInstaller(registry: registry).executionReady, "runtimeQualificationPending")
         let durable = snapshot.devices.contains { $0.bindingEligibility == .durable && $0.endpoints.contains { $0.id == endpoint.id } }
         try requireContract(binding.selector.id == endpoint.id && (durable || binding.selector.incarnationID == endpoint.incarnationID)
             && binding.selector.identity == endpoint.identity, "staleBinding")
@@ -296,7 +300,7 @@ extension DeviceControlCoordinator {
         try BuiltInControlDomainCatalog.validate(content.manifest, endpoint: endpoint, snapshot: snapshot)
         let identity = try DeviceContractIdentity(deviceID: endpoint.id, incarnationID: endpoint.incarnationID, bindingID: binding.id,
             providerDigest: binding.digest, domainID: endpoint.physicalDomainID)
-        let request = try DeviceResourceLock.controlRequest(endpoint, graph: MacUSBPeripheralReader.controlGraph(from: USBDeviceGraph.enumerateUSB()), descriptor: content.manifest.descriptor)
+        let request = try DeviceResourceLock.controlRequest(endpoint, usbGraph: { try MacUSBPeripheralReader.controlGraph(from: USBDeviceGraph.enumerateUSB()) }, descriptor: content.manifest.descriptor)
         let runner = DeviceAdapterRunner(registry: registry, host: try hostPin.get())
         let revalidate: (DeviceResourceLock) async throws -> Void = { lease in
             let currentMetadata = try registry.snapshot(); try requireContract(currentMetadata == metadata, "registryChanged")
@@ -304,7 +308,6 @@ extension DeviceControlCoordinator {
             try DeviceSupportResolver.guardSelected(endpoint: endpoint, manifest: content.manifest, lease: lease, snapshot: { current }, usbSource: { try USBDeviceGraph.enumerateUSB() })
         }
         return ResolvedDeviceControl(identity: identity, descriptor: content.manifest.descriptor, registryRevision: metadata.revision, lockRequest: request,
-            unavailableForMutation: SupportPackageInstaller(registry: registry).executionReady ? nil : "runtimeQualificationPending",
             revalidate: revalidate, read: { lease in
                 let result = try await runner.invoke(content: content, payload: .read(identity: identity, endpoint: endpoint, capabilityIDs: content.manifest.descriptor.capabilities.map(\.id)), timeout: 10, lease: lease)
                 guard case .read(let state) = result else { throw DeviceContractError.invalid("missingReadback") }; return state

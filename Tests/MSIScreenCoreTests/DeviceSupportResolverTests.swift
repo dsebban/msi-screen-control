@@ -176,10 +176,12 @@ final class DeviceSupportResolverTests: XCTestCase {
     }
     func testMetadataCollisionCannotPickFirstAndAllExperimentalReadinessStaysDisabled() throws {
         let endpoint = try endpoint(vendor: 1, product: 2), inventory = try snapshot(endpoint)
-        func binding(_ id: String) throws -> SupportBinding { try SupportBinding(id: id, selector: endpoint, packageID: "test.fixture", digest: digest, enabled: true) }
+        func binding(_ id: String, enabled: Bool = true) throws -> SupportBinding { try SupportBinding(id: id, selector: endpoint, packageID: "test.fixture", digest: digest, enabled: enabled) }
         let one = try SupportRegistrySnapshot(packages: ["test.fixture": [digest]], bindings: [binding("one")])
         XCTAssertEqual(DeviceSupportResolver.resolve(endpoint: endpoint, snapshot: inventory, registry: one), .disabled(reason: "executionValidationPending"))
-        let two = try SupportRegistrySnapshot(packages: one.packages, bindings: [binding("two"), binding("one")])
+        let disabled = try SupportRegistrySnapshot(packages: one.packages, bindings: [binding("one", enabled: false)])
+        XCTAssertEqual(DeviceSupportResolver.resolve(endpoint: endpoint, snapshot: inventory, registry: disabled), .disabled(reason: "bindingDisabled"))
+        let two = try SupportRegistrySnapshot(packages: one.packages, bindings: [binding("two", enabled: false), binding("one")])
         XCTAssertEqual(DeviceSupportResolver.resolve(endpoint: endpoint, snapshot: inventory, registry: two), .collision(candidates: ["one", "two"]))
     }
 }

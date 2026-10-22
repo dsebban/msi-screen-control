@@ -30,16 +30,23 @@ public final class MacDeviceInventoryReader: DeviceInventoryClient, @unchecked S
     public func snapshot() async throws -> DeviceInventorySnapshot {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
-                continuation.resume(with: Result {
-                    try requireContract(self.generation < UInt64.max, "inventoryGenerationExhausted")
-                    self.generation += 1
-                    return try Self.build(identity: self.identity, bootIdentity: self.bootIdentity ?? self.transientBoot,
-                        bootIdentityAvailable: self.bootIdentity != nil,
-                        displays: Self.read(self.sources.displays), usb: Self.read(self.sources.usb), hid: Self.read(self.sources.hid),
-                        generation: self.generation, checkedAtMilliseconds: Int64(Date().timeIntervalSince1970 * 1000))
-                })
+                continuation.resume(with: Result { try self.capture() })
             }
         }
+    }
+
+    /// Fresh passive enumeration inside synchronous metadata CAS/lease checks.
+    /// Call off the main actor; generation and sources retain one queue owner.
+    public func snapshotSynchronously() throws -> DeviceInventorySnapshot {
+        try queue.sync { try capture() }
+    }
+    private func capture() throws -> DeviceInventorySnapshot {
+        try requireContract(generation < UInt64.max, "inventoryGenerationExhausted")
+        generation += 1
+        return try Self.build(identity: identity, bootIdentity: bootIdentity ?? transientBoot,
+            bootIdentityAvailable: bootIdentity != nil,
+            displays: Self.read(sources.displays), usb: Self.read(sources.usb), hid: Self.read(sources.hid),
+            generation: generation, checkedAtMilliseconds: Int64(Date().timeIntervalSince1970 * 1000))
     }
 
     private static func read<T>(_ source: () throws -> InventorySourceSlice<T>) -> InventorySourceSlice<T> {
@@ -109,9 +116,10 @@ public final class MacDeviceInventoryReader: DeviceInventoryClient, @unchecked S
             for character in clean { if result.utf8.count + String(character).utf8.count > 128 { break }; result.append(character) }
             return result.isEmpty ? kind.rawValue : result
         }
-        func facts(_ transport: DeviceTransport, _ vendor: Int?, _ product: Int?, _ usages: [DeviceUsage] = [], _ interface: UInt8? = nil) throws -> DevicePassiveIdentity {
+        func facts(_ transport: DeviceTransport, _ vendor: Int?, _ product: Int?, _ usages: [DeviceUsage] = [],
+                   _ interface: UInt8? = nil, isBuiltIn: Bool? = nil) throws -> DevicePassiveIdentity {
             try DevicePassiveIdentity(transport: transport, vendorID: vendor.flatMap(UInt32.init(exactly:)),
-                productID: product.flatMap(UInt32.init(exactly:)), interfaceNumber: interface, usages: usages)
+                productID: product.flatMap(UInt32.init(exactly:)), interfaceNumber: interface, usages: usages, isBuiltIn: isBuiltIn)
         }
         var records: [DeviceRecord] = []
         var usbIDs: [UInt64: String] = [:], usbDomains: [UInt64: String] = [:], usbAnchors: [UInt64: [String]] = [:]
@@ -147,7 +155,7 @@ public final class MacDeviceInventoryReader: DeviceInventoryClient, @unchecked S
             let kind: DeviceKind = node.deviceClass == 9 ? .hub :
                 ((node.vendor == 0x046d && node.product == 0xc548) || (node.vendor == 0x24ae && node.product == 0x186a)) ? .receiver : .other
             let endpoint = try DeviceEndpoint(kind: .usb, id: identity.token("endpoint-usb", fields),
-                identity: facts(.usb, node.vendor, node.product), physicalDomainID: usbDomains[node.id]!,
+                identity: facts(.usb, node.vendor, node.product, isBuiltIn: node.isBuiltIn), physicalDomainID: usbDomains[node.id]!,
                 incarnationID: identity.token("incarnation", [bootIdentity, "usb", String(node.id), String(node.parentID ?? 0)]),
                 address: .usb(registryID: node.id, parentID: node.parentID))
             let relations = try node.parentID.flatMap { usbIDs[$0] }.map { [try DeviceRelation(kind: .usbParent, targetID: $0, evidence: .osAncestry)] } ?? []
@@ -198,7 +206,8 @@ public final class MacDeviceInventoryReader: DeviceInventoryClient, @unchecked S
                     domain = identity.token("physical-domain", durable ?? [bootIdentity, "hid", String(node.id)])
                 }
                 endpoints.append(try DeviceEndpoint(kind: .hid, id: identity.token("endpoint-hid", fields),
-                    identity: facts(node.transport, node.vendor, node.product, node.usages, node.interfaceNumber), physicalDomainID: domain,
+                    identity: facts(node.transport, node.vendor, node.product, node.usages, node.interfaceNumber,
+                        isBuiltIn: node.isBuiltIn), physicalDomainID: domain,
                     incarnationID: identity.token("incarnation", [bootIdentity, "hid", String(node.id), String(node.usbDeviceID ?? 0), String(node.interfaceID ?? 0)]),
                     address: .hid(registryID: node.id, usbDeviceID: node.usbDeviceID, interfaceID: node.interfaceID)))
             }

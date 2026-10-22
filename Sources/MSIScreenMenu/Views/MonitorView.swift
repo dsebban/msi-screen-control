@@ -8,7 +8,12 @@ struct MonitorView: View {
     @ObservedObject var computers: ComputersStore
     @ObservedObject var updater: AppUpdater
     @ObservedObject var appSettings: AppSettings
+    @ObservedObject var inventory: DeviceInventoryStore
+    @ObservedObject var deviceControl: DeviceControlStore
+    private var runtimeBusy: Bool { deviceControl.busy || inventory.handoffBusy || inventory.managementBusy || appSettings.hasActiveOperation }
+    private var allBusy: Bool { store.hasActiveOperation || computers.busy || runtimeBusy }
     let closeControls: () -> Void
+    var fixtureTabObservation: ((String, String) -> Void)? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var tab: Tab = .layout
     @State private var machineEditor: MachineEditorRequest?
@@ -17,10 +22,11 @@ struct MonitorView: View {
     private struct MachineEditorRequest: Identifiable {
         let id = UUID()
         let machine: MachineDefinition?
+        var suggestedMachine: MachineDefinition? = nil
     }
 
     private enum Tab: String, CaseIterable {
-        case layout = "Layout", monitor = "Monitor", machines = "Machines", peripherals = "Peripherals", settings = "Settings"
+        case layout = "Layout", monitor = "Monitor", devices = "Devices", machines = "Machines", peripherals = "Peripherals", settings = "Settings"
     }
 
     private var motion: Animation? {
@@ -35,15 +41,25 @@ struct MonitorView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     switch tab {
-                    case .layout: layoutControls
-                    case .monitor: monitorControls
-                    case .machines: machineControls
+                    case .layout:
+                        if inventory.usesBuiltInMonitor { layoutControls.disabled(runtimeBusy) }
+                        else { DeviceControlSummary(inventory: inventory, control: deviceControl, category: .layout) }
+                    case .monitor:
+                        if inventory.usesBuiltInMonitor { monitorControls.disabled(runtimeBusy) }
+                        else { DeviceControlSummary(inventory: inventory, control: deviceControl) }
+                    case .devices: DevicesView(inventory: inventory, control: deviceControl)
+                    case .machines:
+                        if inventory.fixtureLabel != nil { Text("Compiled machine/remote controls are not executed by this isolated fixture.").font(.caption) }
+                        else { machineControls.disabled(runtimeBusy) }
                     case .peripherals:
-                        PeripheralsView(store: store, usbHostName: usbHostName,
-                                        machines: prefs.machines, configurationError: prefs.error,
-                                        controlsBusy: computers.isMutating)
+                        if inventory.fixtureLabel != nil { DeviceControlSummary(inventory: inventory, control: deviceControl) }
+                        else { PeripheralsView(store: store, usbHostName: usbHostName,
+                                        machines: prefs.machines, upstreamMachineID: prefs.usbUpstreamMachine?.id,
+                                        configurationError: prefs.error,
+                                        controlsBusy: computers.isMutating || runtimeBusy,
+                                        inventory: inventory, deviceControl: deviceControl) }
                     case .settings:
-                        AppSettingsView(settings: appSettings).monitorCard()
+                        AppSettingsView(settings: appSettings, inventory: inventory, controlsBusy: deviceControl.busy || store.hasActiveOperation || computers.busy || inventory.managementBusy || inventory.handoffBusy).monitorCard()
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -62,35 +78,51 @@ struct MonitorView: View {
         .clipShape(RoundedRectangle(cornerRadius: 17))
         .preferredColorScheme(.dark)
         .ignoresSafeArea()
-        .tint(MonitorAppearance.tint(for: store.state))
+        .tint(MonitorAppearance.tint(for: inventory.usesBuiltInMonitor ? store.state : nil))
+        .onAppear { fixtureTabObservation?(tab.rawValue, "initial-tab") }
         .onChange(of: tab) { selection in
+            fixtureTabObservation?(selection.rawValue, "tab-state-changed")
+            if inventory.fixtureLabel != nil { inventory.refresh(); return }
             store.showingSettings = selection == .monitor
             switch selection {
-            case .layout: break
-            case .monitor: store.refreshSettings()
+            case .layout: inventory.refresh()
+            case .devices: inventory.refresh()
+            case .monitor:
+                inventory.refresh()
+                if inventory.usesBuiltInMonitor { store.refreshSettings() }
             case .machines:
+                inventory.refresh()
                 store.refresh()
                 computers.refresh()
             case .peripherals:
+                inventory.refresh()
                 store.refreshPeripherals()
                 store.refreshPointerCapabilities()
             case .settings: appSettings.refresh()
             }
         }
         .sheet(item: $machineEditor) { request in
-            MachineEditor(machine: request.machine, preferences: prefs) { computers.refresh() }
+            MachineEditor(machine: request.machine, suggestedMachine: request.suggestedMachine,
+                          preferences: prefs) { computers.refresh() }
                 .preferredColorScheme(.dark)
         }
     }
 
+    private func selectTab(_ selection: Tab, reason: String) {
+        tab = selection
+        fixtureTabObservation?(selection.rawValue, reason)
+    }
+
     private var tabControls: some View {
-        HStack(spacing: 0) {
+        ScrollView(.horizontal, showsIndicators: false) {
+          HStack(spacing: 0) {
             ForEach(Tab.allCases, id: \.self) { item in
-                Button { tab = item } label: {
+                Button { selectTab(item, reason: "tab-button") } label: {
                     Text(item.rawValue)
                         .font(.system(size: 12, weight: tab == item ? .semibold : .medium))
                         .lineLimit(1)
-                        .frame(maxWidth: .infinity)
+                        .frame(minWidth: 68)
+                        .padding(.horizontal, 6)
                         .frame(height: 30)
                         .background(tab == item ? Color.white.opacity(0.18) : .clear,
                                     in: RoundedRectangle(cornerRadius: 7))
@@ -98,14 +130,16 @@ struct MonitorView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(item.rawValue)
+                .accessibilityIdentifier(item == .devices ? "devices-tab" : "\(item.rawValue.lowercased())-tab")
                 .accessibilityValue(tab == item ? "Selected" : "Not selected")
                 .accessibilityAddTraits(tab == item ? .isSelected : [])
                 if item != Tab.allCases.last {
                     Rectangle().fill(.white.opacity(0.13)).frame(width: 1, height: 18)
                 }
             }
+          }
+          .padding(1)
         }
-        .padding(1)
         .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.white.opacity(0.12), lineWidth: 0.7))
         .accessibilityIdentifier("controls-tab")
@@ -113,18 +147,21 @@ struct MonitorView: View {
 
     private var header: some View {
         HStack(spacing: 14) {
-            MonitorMark(state: store.state)
+            MonitorMark(state: inventory.usesBuiltInMonitor ? store.state : nil)
                 .frame(width: 41, height: 45)
             VStack(alignment: .leading, spacing: 3) {
                 Text("MSI Screen").font(.system(size: 21, weight: .bold))
-                Text("MD342CQP").font(.system(size: 14)).foregroundStyle(MonitorAppearance.secondaryText)
+                Text(inventory.usesBuiltInMonitor ? "MSI monitor" : inventory.selectedTitle)
+                    .font(.system(size: 12)).foregroundStyle(MonitorAppearance.secondaryText).lineLimit(1)
+                Text(inventory.usesBuiltInMonitor ? "Layout, display settings and connected computers" : inventory.providerTitle)
+                    .font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: 6)
-            Button { tab = .layout } label: {
+            Button { selectTab(.layout, reason: "header-layout-action") } label: {
                 HStack(spacing: 8) {
-                    Image(systemName: store.state?.mode == .pbp ? "rectangle.split.2x1" : "display")
+                    Image(systemName: inventory.usesBuiltInMonitor && store.state?.mode == .pbp ? "rectangle.split.2x1" : "display")
                         .font(.system(size: 20, weight: .medium))
-                        .foregroundStyle(MonitorAppearance.tint(for: store.state))
+                        .foregroundStyle(MonitorAppearance.tint(for: inventory.usesBuiltInMonitor ? store.state : nil))
                     Text(modeBadge).font(.system(size: 14, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.85)
                     Image(systemName: "chevron.down").font(.system(size: 10, weight: .semibold))
                 }
@@ -139,6 +176,7 @@ struct MonitorView: View {
     }
 
     private var modeBadge: String {
+        guard inventory.usesBuiltInMonitor else { return deviceControl.observation == nil ? "Not read" : "Observed" }
         guard let state = store.state else { return "—" }
         switch state.mode {
         case .pbp: return "PBP"
@@ -148,8 +186,12 @@ struct MonitorView: View {
     }
 
     private func refreshControls() {
+        inventory.refresh()
+        if inventory.fixtureLabel != nil { return }
+        if !inventory.usesBuiltInMonitor && (tab == .layout || tab == .monitor) { return }
         switch tab {
         case .settings: appSettings.refresh()
+        case .devices: break
         case .layout: store.refreshKVM()
         case .monitor: store.refreshSettings()
         case .machines:
@@ -172,19 +214,8 @@ struct MonitorView: View {
 
     private var layoutControls: some View {
         VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Text(store.isApplying ? "APPLYING LAYOUT" : "LAYOUT PREVIEW")
-                        .font(.system(size: 10, weight: .semibold)).tracking(1)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    if store.isApplying { ProgressView().controlSize(.mini) }
-                }
-                monitorPreview(current: false)
-                if let current = store.currentLayout {
-                    Text(current).font(.caption2).foregroundStyle(.secondary)
-                }
-            }
+            LayoutPreviewView(store: store, prefs: prefs,
+                              controlsBusy: computers.isMutating || runtimeBusy)
 
             Picker("Layout", selection: $store.split) {
                 Text("Full screen").tag(false)
@@ -253,77 +284,6 @@ struct MonitorView: View {
             }
             .monitorCard()
         }
-    }
-
-    private func monitorPreview(current: Bool) -> some View {
-        let pending = store.pendingTarget ?? (current ? store.state : nil)
-        let split = pending.map { $0.mode == .pbp } ?? store.split
-        let left = pending?.source1 ?? store.left
-        let right = pending?.source2 ?? store.right
-        let unknown = store.state == nil && store.pendingTarget == nil
-        return VStack(spacing: 0) {
-            HStack(spacing: 3) {
-                if unknown {
-                    VStack(spacing: 8) {
-                        Label("Monitor unavailable", systemImage: "display.trianglebadge.exclamationmark")
-                            .font(.subheadline.weight(.medium))
-                        if !current {
-                            Text("Reconnect the monitor, then refresh.")
-                                .font(.caption)
-                        }
-                    }
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    previewPane(left, side: split ? "Left" : "Full screen")
-                    if split {
-                        previewPane(right, side: "Right")
-                            .transition(.opacity.combined(with: .scale(scale: 0.97)))
-                    }
-                }
-            }
-            .frame(height: current ? 48 : 126)
-            .padding(5)
-            .background(Color(red: 0.035, green: 0.04, blue: 0.065))
-            .clipShape(RoundedRectangle(cornerRadius: 4))
-            .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(.white.opacity(0.47), lineWidth: 0.65))
-            Rectangle()
-                .fill(LinearGradient(colors: [.white.opacity(0.12), .black.opacity(0.4), .white.opacity(0.13)],
-                                     startPoint: .leading, endPoint: .trailing))
-                .frame(width: 26, height: 11)
-            Capsule()
-                .fill(LinearGradient(colors: [.white.opacity(0.13), .white.opacity(0.28), .white.opacity(0.12)],
-                                     startPoint: .leading, endPoint: .trailing))
-                .frame(width: 195, height: 3)
-        }
-        .padding(.horizontal, 4)
-        .overlay(alignment: .topTrailing) {
-            if current && store.isApplying {
-                Label("Switching…", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 10, weight: .medium))
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(.black.opacity(0.75), in: Capsule())
-                    .padding(9)
-            }
-        }
-        .animation(motion, value: split)
-        .animation(motion, value: left)
-        .animation(motion, value: right)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(unknown ? "Monitor unavailable. Reconnect the monitor, then refresh." :
-            "\(current ? store.isApplying ? "Applying layout" : "Selected layout" : "Proposed layout"): \(left.title)\(split ? " left, \(right.title) right" : " full screen")")
-    }
-
-    private func previewPane(_ input: Input, side: String) -> some View {
-        HStack(spacing: 9) {
-            Image(systemName: "display")
-                .font(.system(size: 22, weight: .regular))
-                .foregroundStyle(MonitorAppearance.tint(for: input))
-            Text(input.title).font(.system(size: 16, weight: .semibold))
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(MonitorScreenArtwork(input: input))
-        .help("\(inputName(input)) · \(side)")
     }
 
     private var monitorControls: some View {
@@ -418,8 +378,11 @@ struct MonitorView: View {
 
     private var machineControls: some View {
         VStack(alignment: .leading, spacing: 8) {
-            monitorPreview(current: true).padding(.bottom, 2)
+            LayoutPreviewView(store: store, prefs: prefs, controlsBusy: allBusy, compact: true).padding(.bottom, 2)
             peripheralControls
+            TailnetMachinesView(computers: computers, machines: prefs.machines) { existing, suggested in
+                machineEditor = MachineEditorRequest(machine: existing, suggestedMachine: suggested)
+            }
             ForEach(orderedMachines) { machine in
                 machineCard(machine)
             }
@@ -430,6 +393,8 @@ struct MonitorView: View {
                     .monitorCard()
             }
             connectionControls.padding(.top, 3)
+            DetectedPeripheralsView(inventory: inventory, control: deviceControl)
+                .padding(.top, 8)
         }
     }
 
@@ -438,8 +403,8 @@ struct MonitorView: View {
         guard let state = store.state else { return prefs.machines }
         let inputs = state.mode == .pbp ? [state.source1, state.source2] : [state.source1]
         return prefs.machines.enumerated().sorted {
-            let left = inputs.firstIndex(of: $0.element.input) ?? inputs.count
-            let right = inputs.firstIndex(of: $1.element.input) ?? inputs.count
+            let left = $0.element.input.flatMap { inputs.firstIndex(of: $0) } ?? inputs.count
+            let right = $1.element.input.flatMap { inputs.firstIndex(of: $0) } ?? inputs.count
             return left == right ? $0.offset < $1.offset : left < right
         }.map(\.element)
     }
@@ -456,6 +421,19 @@ struct MonitorView: View {
                             .accessibilityIdentifier("follow-fullscreen-usb")
                         Text("The USB-C Mac and \(usbUpstreamMachine?.name ?? "the Linux machine") full-screen choices also move the USB hub, including Apply layout. PBP and other inputs keep the selected USB host.")
                             .font(.caption).foregroundStyle(.secondary)
+                        Picker("USB-B computer", selection: Binding(
+                            get: { prefs.usbUpstreamMachineID ?? "" },
+                            set: { prefs.setUSBUpstreamMachine($0.isEmpty ? nil : $0); store.refreshPeripherals() }
+                        )) {
+                            Text("Not assigned").tag("")
+                            ForEach(prefs.machines.filter(\.isUSBUpstreamCandidate)) { machine in
+                                Text(machine.name).tag(machine.id)
+                            }
+                        }
+                        .accessibilityIdentifier("usb-upstream-machine")
+                        .disabled(allBusy || prefs.error != nil)
+                        Text("Choose the computer physically connected to the monitor’s USB-B cable. This setting does not move USB.")
+                            .font(.caption2).foregroundStyle(.secondary)
                         sharingControls
                         DisclosureGroup("Input names") {
                             VStack(spacing: 8) {
@@ -491,7 +469,8 @@ struct MonitorView: View {
     }
 
     private var peripheralControls: some View {
-        USBHostControls(store: store, machines: prefs.machines, configurationError: prefs.error,
+        USBHostControls(store: store, machines: prefs.machines, upstreamMachineID: prefs.usbUpstreamMachine?.id,
+                        configurationError: prefs.error,
                         controlsBusy: computers.isMutating)
             .onAppear { if store.peripherals == nil { store.refreshPeripherals() } }
     }
@@ -501,13 +480,12 @@ struct MonitorView: View {
     }
 
     private var usbUpstreamMachine: MachineDefinition? {
-        let candidates = prefs.machines.filter { $0.platform == .linux }
-        return candidates.count == 1 ? candidates[0] : nil
+        prefs.usbUpstreamMachine
     }
 
     private func machineCard(_ machine: MachineDefinition) -> some View {
         let status = computers.statuses[machine.id]
-        let tint = MonitorAppearance.tint(for: machine.input)
+        let tint = machine.input.map { MonitorAppearance.tint(for: $0) } ?? .secondary
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 12) {
                 Image(systemName: machine.platform == .macos ? "laptopcomputer" : "desktopcomputer")
@@ -525,27 +503,37 @@ struct MonitorView: View {
                         }
                     }
                     HStack(spacing: 6) {
-                        Text(machine.input.title).help("Configured input assignment")
+                        Text(machine.input?.title ?? "Unassigned").help("Configured input assignment")
                         Text("·").foregroundStyle(.tertiary)
                         Text(machineDisplaySummary(machine, status: status))
                     }
                     .font(.system(size: 12))
                     .foregroundStyle(MonitorAppearance.secondaryText)
                     .lineLimit(1)
+                    if prefs.usesUniversalControl(machine) {
+                        Label("Universal Control", systemImage: "link")
+                            .font(.system(size: 10)).foregroundStyle(.purple)
+                            .help("Configured Mac-to-Mac keyboard and mouse sharing")
+                    }
                 }
                 Spacer(minLength: 0)
                 HStack(spacing: 5) {
-                    Circle().fill(reachabilityColor(status)).frame(width: 7, height: 7)
-                    if !machine.isLocal {
+                    if machine.access == .videoOnly {
+                        Text("Video only").font(.system(size: 10))
+                            .foregroundStyle(MonitorAppearance.secondaryText)
+                    } else {
+                        Circle().fill(reachabilityColor(status)).frame(width: 7, height: 7)
+                    }
+                    if machine.access == .ssh {
                         Text(reachabilityText(status, local: false))
                             .font(.system(size: 10))
                             .foregroundStyle(MonitorAppearance.secondaryText)
                             .fixedSize()
                     }
                 }
-                .help(reachabilityText(status, local: machine.isLocal))
+                .help(machine.access == .videoOnly ? "Video source; computer status is unavailable" : reachabilityText(status, local: machine.isLocal))
                 .accessibilityElement(children: .ignore)
-                .accessibilityLabel(reachabilityText(status, local: machine.isLocal))
+                .accessibilityLabel(machine.access == .videoOnly ? "Video only" : reachabilityText(status, local: machine.isLocal))
                 Button {
                     withAnimation(motion) {
                         if expandedMachineIDs.contains(machine.id) { expandedMachineIDs.remove(machine.id) }
@@ -568,7 +556,7 @@ struct MonitorView: View {
                 routeButton(machine, route: .pbpLeft, title: "Left", suffix: "left")
                 routeButton(machine, route: .pbpRight, title: "Right", suffix: "right")
             }
-            if machine.platform == .macos {
+            if machine.platform == .macos && machine.access != .videoOnly {
                 Divider().padding(.vertical, 4)
                 Text("Main & extended displays")
                     .font(.system(size: 11, weight: .semibold))
@@ -578,8 +566,8 @@ struct MonitorView: View {
                 VStack(alignment: .leading, spacing: 9) {
                     Divider()
                     HStack(spacing: 5) {
-                        Text(reachabilityText(status, local: machine.isLocal))
-                        if let status {
+                        Text(machine.access == .videoOnly ? "Video only" : reachabilityText(status, local: machine.isLocal))
+                        if let status, machine.access != .videoOnly {
                             Text("·")
                             Text(status.checkedAt, style: .time).monospacedDigit()
                         }
@@ -596,7 +584,7 @@ struct MonitorView: View {
                     }
                     .font(.system(size: 11))
                     .foregroundStyle(MonitorAppearance.secondaryText)
-                    if machine.platform != .macos {
+                    if machine.platform != .macos || machine.access == .videoOnly {
                         machineDetails(machine, status: status)
                     }
                 }
@@ -624,7 +612,7 @@ struct MonitorView: View {
         } label: {
             Text(title).font(.system(size: 12, weight: .medium)).frame(maxWidth: .infinity)
         }
-        .buttonStyle(MonitorRouteButtonStyle(tint: MonitorAppearance.tint(for: machine.input),
+        .buttonStyle(MonitorRouteButtonStyle(tint: machine.input.map { MonitorAppearance.tint(for: $0) } ?? .secondary,
                                             selected: selectedRoute(machine.input) == route))
         .disabled(computers.isMutating || prefs.error != nil
                   || !store.canRoute(machine, to: route, followUSB: prefs.followFullscreenUSB))
@@ -635,7 +623,11 @@ struct MonitorView: View {
     @ViewBuilder
     private func machineDetails(_ machine: MachineDefinition, status: MachineStatus?) -> some View {
         VStack(alignment: .leading, spacing: 9) {
-            if let status {
+            if machine.access == .videoOnly {
+                Text("Video connection only. Add SSH access to check this computer. USB stays with the selected host.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let status {
                 if let error = status.error {
                     Text(error).font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -652,7 +644,7 @@ struct MonitorView: View {
                                         computers.arrange(machine: machine, laptopPosition: position)
                                     }
                                     .buttonStyle(MonitorRouteButtonStyle(
-                                        tint: MonitorAppearance.tint(for: machine.input),
+                                        tint: machine.input.map { MonitorAppearance.tint(for: $0) } ?? .secondary,
                                         selected: mac.laptopPosition == position))
                                     .accessibilityLabel("Place \(machine.name) MacBook \(position.rawValue) of MSI")
                                     .accessibilityIdentifier("machine-\(machine.id)-laptop-\(position.rawValue)")
@@ -715,15 +707,16 @@ struct MonitorView: View {
         }
     }
 
-    private func selectedRoute(_ input: Input) -> MachineRoute? {
-        guard let state = store.state else { return nil }
+    private func selectedRoute(_ input: Input?) -> MachineRoute? {
+        guard let input, let state = store.state else { return nil }
         if state.mode == .off && state.source1 == input { return .fullscreen }
         if state.mode == .pbp && state.source1 == input { return .pbpLeft }
         if state.mode == .pbp && state.source2 == input { return .pbpRight }
         return nil
     }
 
-    private func selectedPosition(_ input: Input) -> String {
+    private func selectedPosition(_ input: Input?) -> String {
+        guard let input else { return "No monitor input" }
         switch selectedRoute(input) {
         case .fullscreen: return "Full screen"
         case .pbpLeft: return "Left"
@@ -735,8 +728,8 @@ struct MonitorView: View {
         }
     }
 
-    private func isSelected(_ input: Input) -> Bool {
-        guard let state = store.state else { return false }
+    private func isSelected(_ input: Input?) -> Bool {
+        guard let input, let state = store.state else { return false }
         return state.source1 == input || (state.mode == .pbp && state.source2 == input)
             || (state.mode == .pip && state.pipInput == input)
     }
@@ -762,6 +755,18 @@ struct MonitorView: View {
     private var sharingControls: some View {
         DisclosureGroup("Universal Control · Macs only") {
             VStack(alignment: .leading, spacing: 10) {
+                Picker("Shared Mac", selection: Binding(
+                    get: { prefs.universalControlPeerID ?? "" },
+                    set: { prefs.universalControlPeerID = $0.isEmpty ? nil : $0 }
+                )) {
+                    Text("Not configured").tag("")
+                    ForEach(prefs.machines.filter { $0.platform == .macos && !$0.isLocal }) { machine in
+                        Text(machine.name).tag(machine.id)
+                    }
+                }
+                .accessibilityIdentifier("universal-control-peer")
+                Text("Choose the Mac already linked in macOS Universal Control to show keyboard and mouse sharing in the layout.")
+                    .font(.caption2).foregroundStyle(.secondary)
                 Text(computers.sharingSummary).font(.caption)
                 HStack {
                     Button("Check") { computers.checkSharing() }
@@ -793,6 +798,11 @@ struct MonitorView: View {
         return parts.joined(separator: " · ")
     }
 
+    var selectedFooterError: String? {
+        prefs.error ?? ((inventory.usesBuiltInMonitor || tab == .machines || tab == .peripherals) ? store.error : nil)
+            ?? (tab == .machines ? computers.error : nil)
+    }
+
     private var footer: some View {
         VStack(alignment: .leading, spacing: 9) {
             Divider()
@@ -803,10 +813,10 @@ struct MonitorView: View {
                     Spacer()
                     Button("Install…") { updater.checkForUpdates() }
                         .accessibilityLabel("Install update")
-                        .disabled(!updater.canCheck || store.busy || computers.busy)
+                        .disabled(!updater.canCheck || allBusy)
                 }
             }
-            if tab != .settings, let error = prefs.error ?? store.error ?? (tab == .machines ? computers.error : nil) {
+            if tab != .settings, let error = selectedFooterError {
                 Text(error).font(.caption).foregroundStyle(.red)
                     .lineLimit(4)
                     .help(error)
@@ -815,12 +825,12 @@ struct MonitorView: View {
             HStack(spacing: 8) {
                 if tab == .settings {
                     Image(systemName: "gearshape").foregroundStyle(.secondary)
-                } else if store.busy || computers.busy {
+                } else if allBusy {
                     ProgressView().controlSize(.small)
                 } else {
-                    Image(systemName: store.state != nil && !store.needsRefresh ? "checkmark.circle.fill" : "exclamationmark.circle")
+                    Image(systemName: selectedObservationCurrent ? "checkmark.circle.fill" : "exclamationmark.circle")
                         .font(.system(size: 15))
-                        .foregroundStyle(store.state != nil && !store.needsRefresh ? Color.green : .orange)
+                        .foregroundStyle(selectedObservationCurrent ? Color.green : .orange)
                 }
                 Text(footerMessage)
                     .font(.system(size: 10)).foregroundStyle(MonitorAppearance.secondaryText)
@@ -832,8 +842,8 @@ struct MonitorView: View {
                 Button { refreshControls() } label: {
                     HStack(spacing: 5) {
                         Image(systemName: "arrow.clockwise").font(.system(size: 15, weight: .medium))
-                            .foregroundStyle(MonitorAppearance.tint(for: store.state))
-                        if let date = store.verifiedAt {
+                            .foregroundStyle(MonitorAppearance.tint(for: inventory.usesBuiltInMonitor ? store.state : nil))
+                        if let date = inventory.usesBuiltInMonitor ? store.verifiedAt : deviceControl.observation.map({ Date(timeIntervalSince1970: Double($0.checkedAtMilliseconds) / 1000) }) {
                             Text(date, style: .time).font(.system(size: 10).monospacedDigit())
                                 .foregroundStyle(MonitorAppearance.secondaryText)
                         }
@@ -842,11 +852,11 @@ struct MonitorView: View {
                 .buttonStyle(.borderless)
                 .help("Refresh current controls")
                 .accessibilityLabel(tab == .settings ? "Refresh app settings" : tab == .peripherals ? "Refresh peripheral controls" : "Refresh monitor")
-                .disabled(store.busy || computers.busy || (tab == .peripherals && store.pointerProbeBusy))
+                .disabled(allBusy || (tab == .peripherals && store.pointerProbeBusy))
                 Menu {
-                    Button("Settings…") { tab = .settings }
+                    Button("Settings…") { selectTab(.settings, reason: "footer-settings-action") }
                         .keyboardShortcut(",", modifiers: .command)
-                    if tab == .layout {
+                    if tab == .layout && inventory.usesBuiltInMonitor {
                         Button("Copy CLI command") {
                             NSPasteboard.general.clearContents()
                             if let application = store.layoutApplication(machines: prefs.machines,
@@ -861,12 +871,12 @@ struct MonitorView: View {
                     Button(updater.readyVersion == nil ? "Check for updates…" : "Install update…") {
                         updater.checkForUpdates()
                     }
-                    .disabled(!updater.canCheck || store.busy || computers.busy)
+                    .disabled(!updater.canCheck || allBusy)
                     .help("Updates are available in release builds.")
                     Button("Close controls", action: closeControls)
                         .keyboardShortcut("w", modifiers: .command)
                     Button("Quit") { NSApplication.shared.terminate(nil) }
-                        .disabled(store.busy || computers.busy)
+                        .disabled(allBusy)
                 } label: {
                     Image(systemName: "ellipsis").font(.system(size: 10))
                 }
@@ -877,6 +887,10 @@ struct MonitorView: View {
         }
     }
 
+    private var selectedObservationCurrent: Bool {
+        inventory.usesBuiltInMonitor ? store.state != nil && !store.needsRefresh : deviceControl.observation != nil && !deviceControl.needsRefresh
+    }
+
     private var machineFooterMessage: String {
         if store.busy || store.needsRefresh || store.error != nil { return store.message }
         if computers.busy { return computers.message }
@@ -884,6 +898,8 @@ struct MonitorView: View {
     }
 
     private var footerMessage: String {
+        if tab == .devices { return inventory.message }
+        if !inventory.usesBuiltInMonitor && (tab == .layout || tab == .monitor) { return deviceControl.message }
         if tab == .settings { return appSettings.loginStatusText }
         if tab == .machines { return machineFooterMessage }
         guard tab == .peripherals else { return store.message }
@@ -904,7 +920,9 @@ struct MonitorView: View {
 
     private func inputPicker(_ label: String, selection: Binding<Input>) -> some View {
         Picker(label, selection: selection) {
-            ForEach(Input.allCases, id: \.self) { input in Text(input.title).tag(input) }
+            ForEach(Input.allCases, id: \.self) { input in
+                Text(inputName(input) == input.title ? input.title : "\(inputName(input)) · \(input.title)").tag(input)
+            }
         }
     }
 }
@@ -948,20 +966,24 @@ private struct MachineEditor: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name: String
     @State private var platform: MachinePlatform
-    @State private var input: Input
-    @State private var isLocal: Bool
+    @State private var input: Input?
+    @State private var access: MachineAccess
     @State private var host: String
+    @State private var sshTransport: SSHTransport
     @State private var error: String?
 
-    init(machine: MachineDefinition?, preferences: MonitorPreferences, onSave: @escaping () -> Void) {
+    init(machine: MachineDefinition?, suggestedMachine: MachineDefinition? = nil,
+         preferences: MonitorPreferences, onSave: @escaping () -> Void) {
         self.machine = machine
         self.preferences = preferences
         self.onSave = onSave
-        _name = State(initialValue: machine?.name ?? "")
-        _platform = State(initialValue: machine?.platform ?? .macos)
-        _input = State(initialValue: machine?.input ?? .dp)
-        _isLocal = State(initialValue: machine?.isLocal ?? false)
-        _host = State(initialValue: machine?.host ?? "")
+        let initial = machine ?? suggestedMachine
+        _name = State(initialValue: initial?.name ?? "")
+        _platform = State(initialValue: initial?.platform ?? .macos)
+        _input = State(initialValue: initial == nil ? .dp : initial?.input)
+        _access = State(initialValue: initial?.access ?? .videoOnly)
+        _host = State(initialValue: initial?.host ?? "")
+        _sshTransport = State(initialValue: initial?.sshTransport ?? .standard)
     }
 
     var body: some View {
@@ -975,19 +997,32 @@ private struct MachineEditor: View {
                     Text("Linux").tag(MachinePlatform.linux)
                 }
                 Picker("Monitor input", selection: $input) {
-                    ForEach(Input.allCases, id: \.self) { Text($0.title).tag($0) }
+                    Text("Unassigned").tag(nil as Input?)
+                    ForEach(Input.allCases, id: \.self) { Text($0.title).tag(Optional($0)) }
                 }
-                Toggle("This Mac", isOn: $isLocal)
-                    .disabled(platform != .macos)
-                if !isLocal {
-                    TextField("SSH host or alias", text: $host)
+                Picker("Access", selection: $access) {
+                    if platform == .macos { Text("This Mac").tag(MachineAccess.local) }
+                    Text("SSH").tag(MachineAccess.ssh)
+                    Text("Video only").tag(MachineAccess.videoOnly)
+                }
+                if access == .ssh {
+                    Picker("SSH transport", selection: $sshTransport) {
+                        Text("Standard SSH").tag(SSHTransport.standard)
+                        Text("Tailscale SSH").tag(SSHTransport.tailscale)
+                    }
+                    .accessibilityLabel("Machine SSH transport")
+                    TextField(sshTransport == .tailscale ? "user@Tailscale name or IP" : "SSH host or alias", text: $host)
                         .accessibilityLabel("Machine SSH host")
                 }
             }
             .formStyle(.grouped)
-            .onChange(of: platform) { if $0 == .linux { isLocal = false } }
-            Text("Assign the input that this machine uses. Remote checks use your existing trusted SSH connection; remote Macs also need the MSI Screen companion.")
+            .onChange(of: platform) { if $0 == .linux && access == .local { access = .videoOnly } }
+            Text("Choose Video only for a connected source without SSH. Unassigned keeps a saved machine without using a monitor input. SSH checks use your existing trusted connection.")
                 .font(.caption).foregroundStyle(.secondary)
+            if access == .ssh && sshTransport == .tailscale {
+                Text("Tailscale SSH uses the installed Tailscale app or CLI and the target machine’s SSH policy.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if let error {
                 Text(error).font(.caption).foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1008,7 +1043,7 @@ private struct MachineEditor: View {
                 Button("Save") { save() }
                     .keyboardShortcut(.defaultAction)
                     .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                              || (!isLocal && host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                              || (access == .ssh && host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
             }
         }
         .padding(22)
@@ -1021,7 +1056,8 @@ private struct MachineEditor: View {
                 id: machine?.id ?? UUID().uuidString.lowercased(),
                 name: name.trimmingCharacters(in: .whitespacesAndNewlines),
                 platform: platform, input: input,
-                host: isLocal ? nil : host.trimmingCharacters(in: .whitespacesAndNewlines)
+                host: access == .ssh ? host.trimmingCharacters(in: .whitespacesAndNewlines) : nil,
+                access: access, sshTransport: access == .ssh ? sshTransport : .standard
             ), replacing: machine)
             onSave()
             dismiss()

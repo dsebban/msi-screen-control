@@ -5,12 +5,12 @@ struct LayoutApplication {
     let target: ScreenState
     let focusMachine: MachineDefinition?
 
-    init(target: ScreenState, machines: [MachineDefinition], followUSB: Bool) {
+    init(target: ScreenState, machines: [MachineDefinition], followUSB: Bool, usbUpstreamMachineID: String? = nil) {
         self.target = target
         let assigned = machines.filter { $0.input == target.source1 }
         if followUSB, target.mode == .off, assigned.count == 1,
            let machine = assigned.first,
-           (machine.isLocal && machine.input == .usbc) || machine.platform == .linux {
+           machine.followsFullscreenUSB(upstreamMachineID: usbUpstreamMachineID) {
             focusMachine = machine
         } else {
             focusMachine = nil

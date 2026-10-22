@@ -1,0 +1,4 @@
+interface:
+  display_name: "Write Ad-hoc Device Support"
+  short_description: "Author checked local MSI Screen device support"
+  default_prompt: "Use $write-addhoc-support to resolve this local support-request handle and author validated experimental support without hardware experiments."

@@ -61,12 +61,12 @@ public struct USBPeripheralClient {
         }
     }
 
-    public func remote(host: String) async throws -> USBPeripheralSnapshot {
+    public func remote(host: String, transport: SSHTransport = .standard) async throws -> USBPeripheralSnapshot {
         try Task.checkCancellation()
-        try RemoteMacClient(host: host).validateHost()
+        try RemoteMacClient(host: host, transport: transport).validateHost()
         let output = try await ProcessRunner.run(
-            executable: URL(fileURLWithPath: "/usr/bin/ssh"),
-            arguments: RemoteKVMEndpoint.arguments(host: host), timeout: 15,
+            executable: try transport.executable(),
+            arguments: try RemoteKVMEndpoint.arguments(host: host, transport: transport), timeout: 15,
             input: Data(#"{"schemaVersion":1,"action":"peripherals"}"#.utf8), outputLimit: 32_768
         )
         guard !output.timedOut else { throw ScreenError.message("Linux peripheral check timed out") }
@@ -88,10 +88,11 @@ public struct USBPeripheralClient {
         }
     }
 
-    public func remoteDetails(host: String, for expected: PairedUSBPeripheral) async throws -> POPKeyboardDetails {
+    public func remoteDetails(host: String, transport: SSHTransport = .standard,
+                              for expected: PairedUSBPeripheral) async throws -> POPKeyboardDetails {
         try Task.checkCancellation()
         try POPKeyboardProbe.validateExpected(expected)
-        try RemoteMacClient(host: host).validateHost()
+        try RemoteMacClient(host: host, transport: transport).validateHost()
         struct Request: Encodable {
             let schemaVersion = 1
             let action = "popDetails"
@@ -99,8 +100,9 @@ public struct USBPeripheralClient {
             let expectedWirelessProductID: String
         }
         let input = try JSONEncoder().encode(Request(slot: expected.slot, expectedWirelessProductID: expected.wirelessProductID))
-        let output = try await ProcessRunner.run(executable: URL(fileURLWithPath: "/usr/bin/ssh"),
-            arguments: RemoteKVMEndpoint.arguments(host: host), timeout: 20, input: input, outputLimit: 65_536)
+        let output = try await ProcessRunner.run(executable: try transport.executable(),
+            arguments: try RemoteKVMEndpoint.arguments(host: host, transport: transport),
+            timeout: 20, input: input, outputLimit: 65_536)
         guard !output.timedOut else { throw ScreenError.message("Linux POP Keys detail check timed out") }
         guard output.succeeded, !output.truncated else {
             throw ScreenError.message(output.exitCode == 127

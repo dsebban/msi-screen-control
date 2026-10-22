@@ -5,6 +5,29 @@ final class KVMCoordinatorTests: XCTestCase {
     let mac = MachineDefinition(id: "local", name: "Mac", platform: .macos, input: .usbc, host: nil)
     let linux = MachineDefinition(id: "linux", name: "Linux", platform: .linux, input: .dp, host: "test-linux")
 
+    func testVideoOnlyLinuxDoesNotReplaceUnassignedSSHUSBHost() throws {
+        var savedLinux = linux
+        savedLinux.input = nil
+        let deck = MachineDefinition(id: "deck", name: "Steam Deck", platform: .linux,
+                                     input: .dp, host: nil, access: .videoOnly)
+        let registry = MachineRegistry(machines: [mac, savedLinux, deck], usbUpstreamMachineID: savedLinux.id)
+        XCTAssertEqual(try KVMCoordinator(registry: registry).upstreamMachine, savedLinux)
+        XCTAssertThrowsError(try KVMCoordinator(registry: registry, upstreamMachineID: deck.id))
+        XCTAssertNil(try KVMCoordinator(registry: MachineRegistry(machines: [mac, deck])).upstreamMachine)
+    }
+
+    func testSavedUSBUpstreamSurvivesAddingAnotherLinuxSSHMachine() throws {
+        let deck = MachineDefinition(id: "deck", name: "Steam Deck", platform: .linux,
+                                     input: .hdmi1, host: "deck@steamdeck", sshTransport: .tailscale)
+        let registry = MachineRegistry(machines: [mac, linux, deck], usbUpstreamMachineID: linux.id)
+        XCTAssertEqual(try KVMCoordinator(registry: registry).upstreamMachine, linux)
+        XCTAssertEqual(try KVMCoordinator(registry: registry, upstreamMachineID: deck.id).upstreamMachine, deck)
+        var ambiguous = registry
+        ambiguous.usbUpstreamMachineID = nil
+        XCTAssertNil(try KVMCoordinator(registry: ambiguous).upstreamMachine,
+                     "Unassigned USB-B must not adopt a network peer")
+    }
+
     final class Endpoint: KVMEndpoint {
         var values: [KVMSnapshot?]
         var reads = 0

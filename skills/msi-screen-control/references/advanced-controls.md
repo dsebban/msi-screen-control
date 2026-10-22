@@ -6,6 +6,7 @@ Check the installed CLI's `--help` before using these commands. Examples ending 
 
 ```sh
 "$MSI_SCREEN" machine list
+"$MSI_SCREEN" machine discover
 "$MSI_SCREEN" machine add gaming-pc --name "Gaming PC" --platform linux --input dp --host gaming-pc --dry-run
 "$MSI_SCREEN" machine update gaming-pc --name "ChimeraOS" --dry-run
 "$MSI_SCREEN" machine status gaming-pc
@@ -14,7 +15,9 @@ Check the installed CLI's `--help` before using these commands. Examples ending 
 "$MSI_SCREEN" machine remove gaming-pc --dry-run
 ```
 
-Choose an unassigned input and an existing SSH alias. Platforms are `macos` / `linux`; use `--local` for this Mac, `--host ALIAS` for a peer. Never infer a host or connect to an unrelated machine. The shared app/CLI registry lives at `~/Library/Application Support/MSI Screen/machines.json`. Removal deletes only the entry; it does not delete the remote computer or change its monitor input. Concurrent edits reject a stale save. `machine arrange ID left|right [--dry-run]` controls that Mac's own desktop, not Universal Control ordering.
+Discovery reads all Tailscale peers, including offline devices; it does not assign monitor cables or prove SSH access. Platforms with computer controls are `macos` / `linux`. Use `--input none` until the video cable is known, `--local` for this Mac, or `--video-only` for a source without SSH. Standard SSH accepts `--host [USER@]HOST`; native Tailscale SSH also needs `--ssh-transport tailscale` and uses Tailscale-distributed host keys. Use a known remote username and check `machine status ID`; never infer credentials or connect to an unrelated machine.
+
+The shared app/CLI registry lives at `~/Library/Application Support/MSI Screen/machines.json`. Version 3 retains explicit SSH transport and the USB-B assignment; older app versions refuse it. `machine usb-upstream ID [--dry-run]` selects the computer physically connected to USB-B without moving the hub; `none` clears the physical assignment without selecting another peer. Adding network peers must not replace that physical assignment. Removal deletes only the entry; it does not delete the remote computer or change its monitor input. Concurrent edits reject a stale save. `machine arrange ID left|right [--dry-run]` controls that Mac's own desktop, not Universal Control ordering.
 
 ## USB ownership
 

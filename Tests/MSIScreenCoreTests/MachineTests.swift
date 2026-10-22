@@ -15,6 +15,106 @@ final class MachineTests: XCTestCase {
                     source1: .usbc, source2: .hdmi1, pipInput: .hdmi1, pipSize: 1, pipPosition: 2)
     }
 
+    func testLegacyRegistryMigratesAccessAndWritesVersionThreeOnEdit() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let store = MachineRegistryStore(url: directory.appendingPathComponent("machines.json"))
+        let legacy = Data(#"{"schemaVersion":1,"machines":[{"id":"mac","name":"Mac","platform":"macos","input":"usbc"},{"id":"linux","name":"Linux","platform":"linux","input":"dp","host":"linux"}]}"#.utf8)
+        try legacy.write(to: store.url)
+        let loaded = try store.load()
+        XCTAssertEqual(loaded.schemaVersion, 3)
+        XCTAssertEqual(loaded.machines.map(\.access), [.local, .ssh])
+        XCTAssertEqual(loaded.usbUpstreamMachineID, "linux")
+        XCTAssertEqual(try Data(contentsOf: store.url), legacy, "Reading must not rewrite the shared file")
+        var updated = loaded
+        updated.machines[1].input = nil
+        updated.machines.append(MachineDefinition(id: "deck", name: "Steam Deck", platform: .linux,
+                                                  input: .dp, host: nil, access: .videoOnly))
+        try store.save(updated, replacing: loaded)
+        XCTAssertEqual(try store.load(), updated)
+        let data = try Data(contentsOf: store.url)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["schemaVersion"] as? Int, 3, "Older applications must reject the new records")
+        let records = try XCTUnwrap(json["machines"] as? [[String: Any]])
+        XCTAssertEqual(records.last?["access"] as? String, "video-only")
+    }
+
+    func testAccessAndUnassignedInputsAreExplicit() throws {
+        let deck = MachineDefinition(id: "deck", name: "Steam Deck", platform: .linux,
+                                     input: .dp, host: nil, access: .videoOnly)
+        var unplugged = linux
+        unplugged.input = nil
+        var peerWithoutVideo = peer
+        peerWithoutVideo.input = nil
+        try MachineRegistry(machines: [local, deck, unplugged, peerWithoutVideo]).validate()
+        XCTAssertFalse(deck.isLocal)
+        XCTAssertThrowsError(try MachineRouter.target(for: unplugged, route: .fullscreen, from: split))
+        XCTAssertEqual(try MachineRouter.target(for: deck, route: .fullscreen, from: split).source1, .dp)
+        var invalid = deck
+        invalid.host = "unexpected-host"
+        XCTAssertThrowsError(try MachineRegistry(machines: [invalid]).validate())
+        let missingAccess = Data(#"{"schemaVersion":2,"machines":[{"id":"deck","name":"Deck","platform":"macos","input":"dp"}]}"#.utf8)
+        XCTAssertThrowsError(try JSONDecoder().decode(MachineRegistry.self, from: missingAccess))
+    }
+
+    func testExistingSSHTransportDefaultsToStandardAndExplicitTransportRoundTrips() throws {
+        let existing = Data(#"{"schemaVersion":2,"machines":[{"id":"linux","name":"Linux","platform":"linux","input":"dp","access":"ssh","host":"configured-linux"}]}"#.utf8)
+        var registry = try JSONDecoder().decode(MachineRegistry.self, from: existing)
+        XCTAssertEqual(registry.machines[0].sshTransport, .standard)
+        XCTAssertEqual(registry.usbUpstreamMachineID, "linux")
+        registry.machines[0].sshTransport = .tailscale
+        registry.machines[0].host = "deck@steamdeck"
+        try registry.validate()
+        let data = try JSONEncoder().encode(registry)
+        XCTAssertEqual(registry.schemaVersion, 3)
+        XCTAssertEqual(try JSONDecoder().decode(MachineRegistry.self, from: data), registry)
+        let missingTransport = Data(#"{"schemaVersion":3,"machines":[{"id":"linux","name":"Linux","platform":"linux","access":"ssh","host":"configured-linux"}]}"#.utf8)
+        XCTAssertThrowsError(try JSONDecoder().decode(MachineRegistry.self, from: missingTransport))
+        var videoOnly = registry.machines[0]
+        videoOnly.access = .videoOnly
+        videoOnly.host = nil
+        XCTAssertThrowsError(try MachineRegistry(machines: [videoOnly]).validate(),
+                             "A saved native transport cannot silently turn into local/video-only access")
+    }
+
+    func testVideoOnlyStatusNeverReportsThisMacOrSSHObservation() async {
+        for platform in MachinePlatform.allCases {
+            let machine = MachineDefinition(id: "source", name: "Configured source", platform: platform,
+                                            input: .dp, host: nil, access: .videoOnly)
+            let status = await MachineStatusClient().state(for: machine)
+            XCTAssertEqual(status.name, machine.name)
+            XCTAssertEqual(status.platform, platform)
+            XCTAssertNil(status.reachable)
+            XCTAssertNil(status.user)
+            XCTAssertNil(status.macDisplays)
+            XCTAssertTrue(status.connectors.isEmpty)
+            XCTAssertNil(status.error)
+        }
+    }
+
+    func testUSBUpstreamMigrationPreservesOnlyUnambiguousLegacyAssignment() throws {
+        let ambiguous = Data(#"{"schemaVersion":2,"machines":[{"id":"linux","name":"Linux","platform":"linux","access":"ssh","host":"linux"},{"id":"deck","name":"Deck","platform":"linux","access":"ssh","host":"deck"}]}"#.utf8)
+        let migrated = try JSONDecoder().decode(MachineRegistry.self, from: ambiguous)
+        XCTAssertNil(migrated.usbUpstreamMachineID)
+        let explicit = MachineRegistry(machines: [linux], usbUpstreamMachineID: linux.id)
+        XCTAssertEqual(try JSONDecoder().decode(MachineRegistry.self, from: JSONEncoder().encode(explicit)), explicit)
+        let unassigned = MachineRegistry(machines: [linux])
+        XCTAssertNil(try JSONDecoder().decode(MachineRegistry.self, from: JSONEncoder().encode(unassigned)).usbUpstreamMachineID,
+                     "Version 3 must preserve an explicit absence rather than infer a stored assignment")
+    }
+
+    func testUSBUpstreamAssignmentRejectsMissingAndIneligibleMachines() throws {
+        for id in ["missing", local.id, peer.id] {
+            XCTAssertThrowsError(try MachineRegistry(machines: [local, peer, linux],
+                                                     usbUpstreamMachineID: id).validate())
+        }
+        var videoOnly = linux
+        videoOnly.access = .videoOnly
+        videoOnly.host = nil
+        XCTAssertThrowsError(try MachineRegistry(machines: [videoOnly], usbUpstreamMachineID: videoOnly.id).validate())
+    }
+
     func testRegistryPersistsSharedStateAndRejectsStaleEdit() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

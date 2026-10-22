@@ -5,6 +5,7 @@ import MSIScreenCore
 struct USBHostControls: View {
     @ObservedObject var store: MonitorStore
     let machines: [MachineDefinition]
+    let upstreamMachineID: String?
     let configurationError: String?
     let controlsBusy: Bool
     var showReceiverSummary = true
@@ -42,8 +43,9 @@ struct USBHostControls: View {
             }
             if showReceiverSummary {
                 VStack(spacing: 4) {
-                    receiverRow(.bolt, label: "Keyboard", symbol: "keyboard")
-                    receiverRow(.rapoo, label: "Mouse", symbol: "computermouse")
+                    ForEach(store.peripherals?.receivers.filter { $0.connection != .notDetected } ?? []) { receiver in
+                        receiverRow(receiver)
+                    }
                 }
             }
             HStack(alignment: .top, spacing: 6) {
@@ -96,22 +98,22 @@ struct USBHostControls: View {
         }
     }
 
-    private func receiverRow(_ kind: USBReceiverKind, label: String, symbol: String) -> some View {
-        let receiver = store.peripherals?.receivers.first { $0.id == kind }
-        let summary = receiver.map(receiverSummary) ?? "Not checked"
+    private func receiverRow(_ receiver: USBReceiverSnapshot) -> some View {
+        let summary = receiverSummary(receiver)
         return HStack(spacing: 6) {
-            Image(systemName: symbol).frame(width: 14).foregroundStyle(.secondary)
-            Text(receiver?.displayName ?? label).font(.system(size: 10, weight: .medium))
+            Image(systemName: receiver.id == .bolt ? "keyboard" : "computermouse")
+                .frame(width: 14).foregroundStyle(.secondary)
+            Text(receiver.displayName).font(.system(size: 10, weight: .medium))
                 .lineLimit(1)
             Spacer(minLength: 3)
             Text(summary).font(.system(size: 10)).foregroundStyle(MonitorAppearance.secondaryText)
                 .lineLimit(1)
-            Circle().fill(receiver.map(receiverColor) ?? .secondary).frame(width: 5, height: 5)
+            Circle().fill(receiverColor(receiver)).frame(width: 5, height: 5)
         }
-        .help(receiver.map(receiverDetails) ?? "Refresh to inspect the receiver.")
+        .help(receiverDetails(receiver))
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(label) receiver: \(summary)")
-        .accessibilityIdentifier("receiver-\(kind == .bolt ? "bolt" : "rapoo")-status")
+        .accessibilityLabel("\(receiver.displayName): \(summary)")
+        .accessibilityIdentifier("receiver-\(receiver.id.rawValue)-status")
     }
 
     private func receiverSummary(_ receiver: USBReceiverSnapshot) -> String {
@@ -151,25 +153,28 @@ struct USBHostControls: View {
     }
 
     private var usbUpstreamMachine: MachineDefinition? {
-        let candidates = machines.filter { $0.platform == .linux }
-        return candidates.count == 1 ? candidates[0] : nil
+        machines.first { $0.id == upstreamMachineID && $0.isUSBUpstreamCandidate }
     }
 
     private var usbConfigurationIssue: String? {
+        Self.configurationIssue(machines: machines, upstreamMachineID: upstreamMachineID)
+    }
+
+    static func configurationIssue(machines: [MachineDefinition], upstreamMachineID: String?) -> String? {
         let local = machines.filter { $0.isLocal && $0.platform == .macos && $0.input == .usbc }
         guard local.count == 1 else {
             return "Assign this Mac to USB-C before switching the USB hub."
         }
-        let linux = machines.filter { $0.platform == .linux }
-        guard linux.count == 1 else {
+        let linux = machines.filter(\.isUSBUpstreamCandidate)
+        guard machines.contains(where: { $0.id == upstreamMachineID && $0.isUSBUpstreamCandidate }) else {
             return linux.isEmpty ? "Add the Linux machine connected to USB-B."
-                : "More than one Linux machine is configured. The USB-B destination is ambiguous."
+                : "Choose the computer connected to USB-B in Connection & input management."
         }
         return nil
     }
 
     private func usbRouteButton(_ route: KVMRoute, title: String, accessibilityLabel: String) -> some View {
-        Button { store.setKVM(route, expectedMachines: machines) } label: {
+        Button { store.setKVM(route, expectedMachines: machines, expectedUpstreamMachineID: upstreamMachineID) } label: {
             HStack(spacing: 6) {
                 Image(systemName: route == .usbc ? "laptopcomputer" : "desktopcomputer")
                 Text(title).font(.system(size: 12, weight: .semibold)).lineLimit(1)

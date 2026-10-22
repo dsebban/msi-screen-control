@@ -17,6 +17,14 @@ Build the current source and run `.build/debug/msi-screen identity` with one MSI
 
 This diagnostic is newer than v0.2.0. The current release remains limited to MD342CQP/V20. A family name alone is insufficient to enable another monitor: confirm its identity and the vendor profile, then verify each advertised feature and physical result before changing the paid compatibility list. Keep per-model register differences in MSIScreenCore, shared by app and CLI.
 
+## Local experimental framework (2026-10-21)
+
+Devices can enumerate OS-visible endpoints independently of MSI availability, prepare a privacy-filtered agent request, and retain checked local profile/native packages. Metadata activation is not model/protocol, hardware, physical-panel or paid compatibility qualification. Shared `1462:3fa4` facts are only candidates; the app never associates them with cached MD342CQP controls. The explicit legacy MSI path retains its existing trusted controller/identity owner.
+
+Production experimental Read/plan/Apply remain refused before trusted-guard/backend construction until native Intel/macOS 13 lifecycle and measured responsible-launch-client/privacy attribution are verified. Rosetta, signatures/notarization, ancestry and caller TCC checks do not close those gates. There is no production override. The verifier's explicitly admitted, labelled, receipt-owned non-hardware fixture uses fixed endpoints and isolated file transports, not live devices; its passes establish software behavior only. External installed-companion background-only GUI action/result evidence remains separate and INCONCLUSIVE until supplied.
+
+Bolt/Rapoo receiver configuration domains remain reserved to compiled owners, including paired devices reached through them. New cooperating binaries share leases; older Bolt clients never took the new lease and cannot be claimed fully excluded. Native adapters are trusted unconfined user code, not sandboxed. No new hardware qualification, compatibility promotion, pairing/firmware/reset, generic remote adapter execution or automatic uncertain-write retry is implied.
+
 ## Sources
 
 - [MSI MD342CQP/MD342CQPW manual](https://download-2.msi.com/archive/mnu_exe/monitor/MD342CQP_MD342CQPWv1.1_English.pdf)

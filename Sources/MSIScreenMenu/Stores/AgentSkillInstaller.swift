@@ -1,45 +1,28 @@
 import Foundation
+import MSIScreenCore
 
+/// Existing callers keep the default name and install(from:to:) façade.
+/// Filesystem policy and ownership receipts are shared with the CLI.
 enum AgentSkillInstaller {
-    static let name = "msi-screen-control"
-
-    static var bundledSkill: URL? {
-        Bundle.main.resourceURL?.appendingPathComponent("AgentSkills/\(name)")
-    }
-
+    static let name = AgentSkill.screenControl.rawValue
+    static var bundledSkill: URL? { try? AgentSkillInstallation.bundledSkill(.screenControl) }
     static var destination: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".agents/skills/\(name)")
+        // Resolution failures are reported by install, never redirected to a real home.
+        (try? AgentSkillInstallation.skillsHome())?.appendingPathComponent(name)
+            ?? URL(fileURLWithPath: "/invalid-msi-screen-skill-root/" + name)
     }
-
-    /// Existing skills can be user-maintained or managed by another installer.
-    /// Only an exact match is a no-op; never replace unfamiliar content.
     static func install(from source: URL, to destination: URL) throws {
-        let files = FileManager.default
-        guard files.fileExists(atPath: source.appendingPathComponent("SKILL.md").path) else {
-            throw InstallError.missingBundle
-        }
-        // lstat semantics also catch a dangling symlink at the destination.
-        if (try? files.attributesOfItem(atPath: destination.path)) != nil {
-            guard files.contentsEqual(atPath: source.path, andPath: destination.path) else {
-                throw InstallError.existingSkill(destination.path)
-            }
-            return
-        }
-        try files.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-        // Copy to an owned staging folder, then publish the complete skill with
-        // a move that refuses a destination created concurrently.
-        let staging = destination.deletingLastPathComponent()
-            .appendingPathComponent(".\(name)-\(UUID().uuidString)")
-        defer { try? files.removeItem(at: staging) }
-        try files.copyItem(at: source, to: staging)
-        try files.moveItem(at: staging, to: destination)
+        _ = try AgentSkillInstallation.skillsHome() // Invalid overrides fail before creating support state.
+        try install(skill: .screenControl, from: source, to: destination, registry: SupportRegistry())
     }
-
+    static func install(skill: AgentSkill, from source: URL, to destination: URL, registry: SupportRegistry) throws {
+        do { _ = try AgentSkillInstallation(registry: registry).install(skill: skill, source: source, destination: destination) }
+        catch AgentSkillInstallError.missingBundle { throw InstallError.missingBundle }
+        catch AgentSkillInstallError.conflict { throw InstallError.existingSkill(destination.path) }
+    }
     enum InstallError: LocalizedError {
         case missingBundle
         case existingSkill(String)
-
         var errorDescription: String? {
             switch self {
             case .missingBundle: return "The agent skill is missing from this app. Install a packaged MSI Screen app."

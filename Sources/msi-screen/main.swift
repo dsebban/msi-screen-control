@@ -40,10 +40,12 @@ msi-screen peripherals probe [--seconds 1..15]
 msi-screen peripherals keyboard --slot N [--machine ID]
 msi-screen set SETTING VALUE [--dry-run]
 msi-screen machine list
+msi-screen machine discover
+msi-screen machine usb-upstream ID|none [--dry-run]
 msi-screen machine status ID
 msi-screen machine arrange ID left|right [--dry-run]
-msi-screen machine add ID --name NAME --platform macos|linux --input INPUT [--host SSH_ALIAS | --local] [--dry-run]
-msi-screen machine update ID [--name NAME] [--platform macos|linux] [--input INPUT] [--host SSH_ALIAS | --local] [--dry-run]
+msi-screen machine add ID --name NAME --platform macos|linux --input INPUT|none [--host [USER@]HOST | --local | --video-only] [--ssh-transport standard|tailscale] [--dry-run]
+msi-screen machine update ID [--name NAME] [--platform macos|linux] [--input INPUT|none] [--host [USER@]HOST | --local | --video-only] [--ssh-transport standard|tailscale] [--dry-run]
 msi-screen machine remove ID [--dry-run]
 msi-screen machine fullscreen|pbp-left|pbp-right ID [--dry-run]
 msi-screen machine focus ID [--expected-usb auto|upstream|usbc] [--dry-run]
@@ -133,11 +135,12 @@ func machineRegistryStore() throws -> MachineRegistryStore {
 }
 
 if let status = await dispatchInternalSupportMode(Array(CommandLine.arguments.dropFirst())) { exit(status) }
+if let status = await dispatchExperimentalCommand(Array(CommandLine.arguments.dropFirst())) { exit(status) }
 
 var before: ScreenState?
 do {
     var args = Array(CommandLine.arguments.dropFirst())
-    if args.isEmpty || args == ["--help"] { print(help); exit(0) }
+    if args.isEmpty || args == ["--help"] { print(help + "\n" + experimentalHelp); exit(0) }
     let dryRun = args.contains("--dry-run")
     args.removeAll(where: { $0 == "--dry-run" })
     let preserveUSBCount = args.filter { $0 == "--preserve-usb" }.count
@@ -160,7 +163,7 @@ do {
                             "peripherals app-switch", "peripherals wheel-action applications|spaces",
                             "peripherals pin-app BUNDLE_ID --expected HEX", "peripherals mouse-button dpi-cycle --expected HEX",
                             "peripherals probe [--seconds 1..15]", "peripherals keyboard --slot N [--machine ID]", "set SETTING VALUE",
-                            "machine list", "machine status ID", "machine add ID", "machine update ID", "machine remove ID",
+                            "machine list", "machine discover", "machine usb-upstream ID|none", "machine status ID", "machine add ID", "machine update ID", "machine remove ID",
                             "machine fullscreen ID", "machine pbp-left ID", "machine pbp-right ID", "machine focus ID"]
             let kvmRoutes = KVMRoute.allCases
             let kvmAccess = "read-write"
@@ -178,6 +181,7 @@ do {
             let typicalMutationSeconds = "5; up to 10 for cold USB-C initialization"
             let displayRequestSchemaVersion = 1
             let displayRequestMaxBytes = 65536
+            let experimental = ExperimentalCapabilities()
         }
         try emit(Capabilities())
         exit(0)
@@ -189,7 +193,21 @@ do {
     if args.first == "machine" {
         guard args.count >= 2 else { throw ScreenError.message("Invalid machine command. Run msi-screen --help") }
         let action = args[1]
-        if action == "list" {
+        if action == "discover" {
+            guard args.count == 2, !dryRun else { throw ScreenError.message("Use machine discover without extra arguments") }
+            let snapshot = await TailnetDiscoveryClient().snapshot()
+            try emit(snapshot)
+            if snapshot.outcome == .failed || snapshot.outcome == .unavailable { exit(1) }
+        } else if action == "usb-upstream" {
+            guard args.count == 3 else { throw ScreenError.message("Use machine usb-upstream ID|none [--dry-run]") }
+            let store = try machineRegistryStore()
+            let previous = try store.load()
+            var updated = previous
+            updated.usbUpstreamMachineID = args[2] == "none" ? nil : args[2]
+            try updated.validate()
+            if !dryRun { try store.save(updated, replacing: previous) }
+            try emit(MachineRegistryResult(dryRun: dryRun, before: previous, after: updated, verified: !dryRun))
+        } else if action == "list" {
             guard args.count == 2, !dryRun else {
                 throw ScreenError.message("Use machine list without extra arguments")
             }
@@ -210,11 +228,11 @@ do {
             let store = try machineRegistryStore()
             let registry = try store.load()
             let machine = try registry.machine(id: args[2])
-            guard machine.platform == .macos else {
-                throw ScreenError.message("MacBook arrangement requires a Mac")
+            guard machine.platform == .macos, machine.access != .videoOnly else {
+                throw ScreenError.message("MacBook arrangement requires local or SSH access to a Mac")
             }
             let state: MacDisplayState
-            if let host = machine.host { state = try await RemoteMacClient(host: host).state() }
+            if let host = machine.host { state = try await RemoteMacClient(host: host, transport: machine.sshTransport).state() }
             else { state = try MacDisplayController().state() }
             let plan = try MacDisplayController.planArrangement(from: state, laptopPosition: position)
             guard try store.load() == registry else {
@@ -222,7 +240,7 @@ do {
             }
             if dryRun { try emit(plan) }
             else if let host = machine.host {
-                try emit(await RemoteMacClient(host: host).arrange(from: state, laptopPosition: position))
+                try emit(await RemoteMacClient(host: host, transport: machine.sshTransport).arrange(from: state, laptopPosition: position))
             } else {
                 try emit(MacDisplayController().arrange(from: state, laptopPosition: position))
             }
@@ -248,6 +266,9 @@ do {
             guard let machine = registry.machines.first(where: { $0.id == args[2] }) else {
                 throw ScreenError.message("Machine ID not found")
             }
+            guard machine.input != nil else {
+                throw ScreenError.message("Assign a monitor input to \(machine.name) before switching its video")
+            }
             let result = try ScreenController.withHIDConnection { controller in
                 let snapshot = try controller.state()
                 before = snapshot
@@ -268,39 +289,43 @@ do {
             }
             let id = args[2]
             var fields: [String: String] = [:]
-            var local = false
+            var access: MachineAccess?
             var index = 3
             while index < args.count {
                 let flag = args[index]
-                if flag == "--local" {
-                    guard !local, fields["--host"] == nil else {
-                        throw ScreenError.message("Use --host or --local once")
+                if flag == "--local" || flag == "--video-only" {
+                    guard access == nil else {
+                        throw ScreenError.message("Use --host, --local, or --video-only once")
                     }
-                    local = true
+                    access = flag == "--local" ? .local : .videoOnly
                     index += 1
                 } else {
-                    guard ["--name", "--platform", "--input", "--host"].contains(flag),
+                    guard ["--name", "--platform", "--input", "--host", "--ssh-transport"].contains(flag),
                           fields[flag] == nil, index + 1 < args.count else {
                         throw ScreenError.message("Unknown, repeated, or incomplete machine option")
                     }
-                    guard flag != "--host" || !local else {
-                        throw ScreenError.message("Use --host or --local once")
+                    guard flag != "--host" || access == nil else {
+                        throw ScreenError.message("Use --host, --local, or --video-only once")
                     }
+                    if flag == "--host" { access = .ssh }
                     fields[flag] = args[index + 1]
                     index += 2
                 }
             }
-            guard action != "remove" || (fields.isEmpty && !local) else {
+            guard action != "remove" || (fields.isEmpty && access == nil) else {
                 throw ScreenError.message("Machine remove accepts only an ID")
             }
-            guard action != "update" || !fields.isEmpty || local else {
+            guard action != "update" || !fields.isEmpty || access != nil else {
                 throw ScreenError.message("Machine update requires at least one changed field")
             }
             if let platform = fields["--platform"], MachinePlatform(rawValue: platform) == nil {
                 throw ScreenError.message("Machine platform must be macos or linux")
             }
-            if let input = fields["--input"], Input(rawValue: input) == nil {
-                throw ScreenError.message("Machine input must be hdmi1, hdmi2, dp, or usbc")
+            if let input = fields["--input"], input != "none", Input(rawValue: input) == nil {
+                throw ScreenError.message("Machine input must be hdmi1, hdmi2, dp, usbc, or none")
+            }
+            if let transport = fields["--ssh-transport"], SSHTransport(rawValue: transport) == nil {
+                throw ScreenError.message("SSH transport must be standard or tailscale")
             }
             let store = try machineRegistryStore()
             let previous = try store.load()
@@ -317,16 +342,29 @@ do {
                 }
                 guard let name = fields["--name"] ?? existing?.name,
                       let platform = fields["--platform"].flatMap(MachinePlatform.init(rawValue:)) ?? existing?.platform,
-                      let input = fields["--input"].flatMap(Input.init(rawValue:)) ?? existing?.input else {
+                      existing != nil || fields["--input"] != nil else {
                     throw ScreenError.message("Machine add requires --name, --platform, and --input")
                 }
+                let input = fields["--input"].map { Input(rawValue: $0) } ?? existing?.input
+                let machineAccess = access ?? existing?.access ?? .local
+                let requestedTransport = fields["--ssh-transport"].flatMap(SSHTransport.init(rawValue:))
+                guard machineAccess == .ssh || requestedTransport != .tailscale else {
+                    throw ScreenError.message("Tailscale SSH transport requires an SSH host")
+                }
                 let machine = MachineDefinition(id: id, name: name, platform: platform, input: input,
-                                                host: local ? nil : fields["--host"] ?? existing?.host)
+                                                host: machineAccess == .ssh ? fields["--host"] ?? existing?.host : nil,
+                                                access: machineAccess,
+                                                sshTransport: machineAccess == .ssh
+                                                    ? requestedTransport ?? existing?.sshTransport ?? .standard : .standard)
                 if let position = updated.machines.firstIndex(where: { $0.id == id }) {
                     updated.machines[position] = machine
                 } else {
                     updated.machines.append(machine)
                 }
+            }
+            if let upstream = updated.usbUpstreamMachineID,
+               !updated.machines.contains(where: { $0.id == upstream && $0.isUSBUpstreamCandidate }) {
+                updated.usbUpstreamMachineID = nil
             }
             try updated.validate()
             if !dryRun {
@@ -476,10 +514,12 @@ do {
             upstreamMachineID: args.count == 6 ? args[5] : nil, registryStore: store)
         let owner = try await coordinator.status()
         let client = USBPeripheralClient()
-        let host = try owner.machineID.flatMap { try registry.machine(id: $0).host }
+        let ownerMachine = try owner.machineID.map { try registry.machine(id: $0) }
+        let host = ownerMachine?.host
+        let transport = ownerMachine?.sshTransport ?? .standard
         let snapshot: USBPeripheralSnapshot
         if owner.controlHost == .local { snapshot = try await client.local() }
-        else if let host { snapshot = try await client.remote(host: host) }
+        else if let host { snapshot = try await client.remote(host: host, transport: transport) }
         else { throw ScreenError.message("The USB host has no SSH connection") }
         guard let paired = snapshot.receivers.first(where: { $0.id == .bolt })?
             .pairedDevices.first(where: { $0.slot == slot }) else {
@@ -487,7 +527,7 @@ do {
         }
         let details: POPKeyboardDetails
         if owner.controlHost == .local { details = try await client.localDetails(for: paired) }
-        else { details = try await client.remoteDetails(host: host!, for: paired) }
+        else { details = try await client.remoteDetails(host: host!, transport: transport, for: paired) }
         guard try store.load() == registry, try await coordinator.status() == owner else {
             throw ScreenError.message("USB ownership or machine assignments changed during inspection")
         }
@@ -510,7 +550,8 @@ do {
             guard let id = owner.machineID, let host = try registry.machine(id: id).host else {
                 throw ScreenError.message("The USB host has no SSH connection")
             }
-            snapshot = try await USBPeripheralClient().remote(host: host)
+            let transport = try registry.machine(id: id).sshTransport
+            snapshot = try await USBPeripheralClient().remote(host: host, transport: transport)
         }
         guard try store.load() == registry, snapshot.monitorHubPresent else {
             throw ScreenError.message("USB ownership or machine assignments changed during inspection; read them again")

@@ -11,6 +11,7 @@ final class RemoteMacClientTests: XCTestCase {
                 }
             }
         }
+        XCTAssertNoThrow(try RemoteMacClient(host: "deck@steamdeck", transport: .tailscale).validateHost())
     }
 
     func testMissingCompanionHasSpecificDiagnostic() {

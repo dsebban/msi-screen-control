@@ -4,6 +4,7 @@ import MSIScreenCore
 @MainActor
 final class MonitorPreferences: ObservableObject {
     @Published private(set) var machines: [MachineDefinition] = []
+    @Published private(set) var usbUpstreamMachineID: String?
     @Published private(set) var error: String?
     @Published var inputNames: [String: String] {
         didSet { defaults.set(inputNames, forKey: "inputNames") }
@@ -11,20 +12,37 @@ final class MonitorPreferences: ObservableObject {
     @Published var followFullscreenUSB: Bool {
         didSet { defaults.set(followFullscreenUSB, forKey: "followFullscreenUSB") }
     }
+    /// A user-confirmed Mac sharing link, independent of USB ownership or
+    /// service health. A configured peer is not a live connectivity verdict.
+    @Published var universalControlPeerID: String? {
+        didSet { defaults.set(universalControlPeerID, forKey: "universalControlPeerID") }
+    }
     private let defaults: UserDefaults
-    private let registryStore = MachineRegistryStore()
+    private let registryStore: MachineRegistryStore
     private var snapshot = MachineRegistry(machines: [])
 
-    var localMachine: MachineDefinition? { machines.first { $0.host == nil } }
-    var peerMachine: MachineDefinition? { machines.first { $0.host != nil && $0.platform == .macos } }
-    var localInput: Input { localMachine?.input ?? .usbc }
-    var peerInput: Input { peerMachine?.input ?? .hdmi1 }
+    var localMachine: MachineDefinition? { machines.first(where: \.isLocal) }
+    var peerMachine: MachineDefinition? { machines.first { $0.access == .ssh && $0.platform == .macos } }
+    var localInput: Input? { localMachine?.input }
+    var peerInput: Input? { peerMachine?.input }
     var peerHost: String { peerMachine?.host ?? "" }
+    var usbUpstreamMachine: MachineDefinition? { snapshot.usbUpstreamMachine }
+    var universalControlPeer: MachineDefinition? {
+        guard localMachine?.platform == .macos else { return nil }
+        return machines.first { $0.id == universalControlPeerID && $0.platform == .macos && !$0.isLocal }
+    }
 
-    init(defaults: UserDefaults = .standard) {
+    func usesUniversalControl(_ machine: MachineDefinition) -> Bool {
+        guard let peer = universalControlPeer else { return false }
+        return machine.id == peer.id || machine.id == localMachine?.id
+    }
+
+    init(defaults: UserDefaults = .standard, registryStore: MachineRegistryStore = MachineRegistryStore()) {
         self.defaults = defaults
+        self.registryStore = registryStore
         inputNames = defaults.dictionary(forKey: "inputNames") as? [String: String] ?? [:]
         followFullscreenUSB = defaults.object(forKey: "followFullscreenUSB") as? Bool ?? true
+        universalControlPeerID = defaults.string(forKey: "universalControlPeerID")
         do {
             // Migrate once, only when no shared registry exists. Thereafter the
             // file owns input/host assignments for both app and CLI.
@@ -47,6 +65,7 @@ final class MonitorPreferences: ObservableObject {
             let updated = try registryStore.load()
             snapshot = updated
             if machines != updated.machines { machines = updated.machines }
+            usbUpstreamMachineID = updated.usbUpstreamMachineID
             error = nil
         } catch { self.error = error.localizedDescription }
     }
@@ -58,7 +77,13 @@ final class MonitorPreferences: ObservableObject {
         var updated = machines
         if let index = updated.firstIndex(where: { $0.id == machine.id }) { updated[index] = machine }
         else { updated.append(machine) }
-        try registryStore.save(MachineRegistry(machines: updated), replacing: snapshot)
+        var registry = snapshot
+        registry.machines = updated
+        if let id = registry.usbUpstreamMachineID,
+           !updated.contains(where: { $0.id == id && $0.isUSBUpstreamCandidate }) {
+            registry.usbUpstreamMachineID = nil
+        }
+        try registryStore.save(registry, replacing: snapshot)
         reload()
     }
 
@@ -66,8 +91,20 @@ final class MonitorPreferences: ObservableObject {
         guard machines.first(where: { $0.id == machine.id }) == machine else {
             throw ScreenError.message("This machine changed while editing. Cancel and reopen its editor.")
         }
-        try registryStore.save(MachineRegistry(machines: machines.filter { $0.id != machine.id }), replacing: snapshot)
+        var registry = snapshot
+        registry.machines.removeAll { $0.id == machine.id }
+        if registry.usbUpstreamMachineID == machine.id { registry.usbUpstreamMachineID = nil }
+        try registryStore.save(registry, replacing: snapshot)
         reload()
+    }
+
+    func setUSBUpstreamMachine(_ id: String?) {
+        do {
+            var registry = snapshot
+            registry.usbUpstreamMachineID = id
+            try registryStore.save(registry, replacing: snapshot)
+            reload()
+        } catch { self.error = error.localizedDescription }
     }
 
     func name(for input: Input, localName: String?, peerName: String?) -> String {

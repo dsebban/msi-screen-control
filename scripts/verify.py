@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import threading
+import tempfile
 import uuid
 from cua_session import CuaSession
 
@@ -53,12 +54,25 @@ parser.add_argument('--peer-host', help='Read the other Mac through its installe
 parser.add_argument('--usb-route', action='store_true', help='With --gui, compare the read-only USB route with CLI kvm status')
 parser.add_argument('--sharing', action='store_true', help='With --gui, explicitly check sharing services')
 parser.add_argument('--idle-seconds', type=int, metavar='N', help='With --gui, measure the owned app with its panel closed for 10–300 seconds')
+parser.add_argument('--support-fixture', action='store_true', help='Isolated, visibly labelled non-hardware app/CLI support lifecycle; no live device/SSH stages. With --gui, prepare externally owned companion QA (INCONCLUSIVE until supplied).')
+parser.add_argument('--support-fixture-action', choices=['exercise', 'prepare', 'serve', 'health', 'stop'], help='Owned support fixture lifecycle; serve is a background-only OMP child service, never a GUI driver')
+parser.add_argument('--support-fixture-root', type=Path, help='Existing owned receipt root for serve/health/stop')
 parser.add_argument('--gui', action='store_true', help='Drive the real menu controls through background Cua Driver')
 parser.add_argument('--offline', action='store_true', help='Check the real CLI and optional bundle without opening USB')
 parser.add_argument('--binary', type=Path, default=root / '.build/debug/msi-screen', help='CLI executable to verify')
-parser.add_argument('--app', type=Path, help='Packaged app to validate in offline mode')
+parser.add_argument('--app', type=Path, help='Packaged app to validate offline or require for a GUI launch')
 parser.add_argument('--dmg', type=Path, help='With --offline, mount a signed/notarized universal DMG read-only and verify its app, CLI and install shortcut')
 args = parser.parse_args()
+if (args.support_fixture_action or args.support_fixture_root) and not args.support_fixture:
+    parser.error('fixture action/root requires --support-fixture')
+if args.support_fixture and any((args.offline, args.dmg, args.previous_app, args.agent_skill_fixture, args.login_item,
+        args.update_fixture, args.install_update, args.menu_appearance, args.permissions, args.peripherals,
+        args.probe_pointer, args.probe_controller, args.exercise, args.exercise_arrangement, args.exercise_controls,
+        args.exercise_peer_controls, args.exercise_machine, args.exercise_machine_editor, args.exercise_kvm,
+        args.exercise_focus, args.peer_host, args.usb_route, args.sharing, args.idle_seconds)):
+    parser.error('--support-fixture is separate from every live, permission, updater and ordinary GUI stage')
+if args.support_fixture and not args.app and not args.support_fixture_root:
+    parser.error('--support-fixture requires the packaged --app (or an existing owned fixture root)')
 if args.install_update and not args.update_fixture:
     parser.error('--install-update requires --update-fixture and explicit foreground approval')
 if args.agent_skill_fixture and (not args.gui or any((args.offline, args.login_item, args.menu_appearance,
@@ -125,14 +139,15 @@ if args.sharing and not args.gui:
 if args.peer_host and (len(args.peer_host) > 128 or args.peer_host.startswith('-')
                        or re.fullmatch(r'[A-Za-z0-9._-]+', args.peer_host) is None):
     parser.error('--peer-host must be an SSH host or alias using letters, digits, dots, underscores, or hyphens')
-if args.app and not args.offline:
-    parser.error('--app requires --offline')
+if args.app and not (args.offline or args.support_fixture or args.gui):
+    parser.error('--app requires --offline, --support-fixture, or --gui')
 binary = args.binary.resolve()
-output = root / '.local' / ('verify-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:6])
-output.mkdir(parents=True)
+output = (Path(tempfile.mkdtemp(prefix='msi-u5-verify-', dir='/private/tmp')) if args.support_fixture else
+          root / '.local' / ('verify-' + datetime.datetime.now().strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:6]))
+output.mkdir(parents=True, exist_ok=True)
 
 
-def run(*command, success=True, input=None, env=None, timeout=40):
+def run(*command, success=True, input=None, env=None, timeout=40, return_event=False):
     started = time.monotonic()
     proc = subprocess.run([str(binary), *command], input=input, capture_output=True, text=True, timeout=timeout,
                           env=None if env is None else {**os.environ, **env})
@@ -155,7 +170,301 @@ def run(*command, success=True, input=None, env=None, timeout=40):
         raise RuntimeError(result)
     if success is False and proc.returncode == 0:
         raise RuntimeError('Invalid command was accepted')
+    return event if return_event else result
+
+
+def verify_skill_resources(app):
+    """Exact two-name catalog, complete trees (including extras/empty dirs), no links."""
+    names = {'msi-screen-control', 'write-addhoc-support'}
+    required = {
+        'msi-screen-control': {'SKILL.md', 'agents/openai.yaml', 'references/advanced-controls.md'},
+        'write-addhoc-support': {'SKILL.md', 'agents/openai.yaml', 'references/contract-v1.md', 'references/validation.md'},
+    }
+    bundled = app / 'Contents/Resources/AgentSkills'
+    assert not bundled.is_symlink() and {p.name for p in bundled.iterdir()} == names, 'Bundled skill catalog is not exact'
+    def tree(directory):
+        assert not directory.is_symlink() and directory.is_dir(), 'Unsafe or missing skill root'
+        entries = {}
+        for p in directory.rglob('*'):
+            assert not p.is_symlink() and (p.is_file() or p.is_dir()), 'Unsafe skill resource'
+            entries[str(p.relative_to(directory)) + ('/' if p.is_dir() else '')] = None if p.is_dir() else hashlib.sha256(p.read_bytes()).hexdigest()
+        return entries
+    result = {}
+    for name in sorted(names):
+        source = tree(root / 'skills' / name)
+        assert {p for p in source if not p.endswith('/')} == required[name], 'Named source skill file set changed'
+        assert tree(bundled / name) == source, 'Bundled skill is changed, missing, or contains stale extras: ' + name
+        result[name] = source
     return result
+
+
+def verify_experimental_cli(capability, app):
+    """U4 gates only: real packaged CLI, passive selection, no live Read/Apply.
+
+    Native validation executes only the source-reviewed hardware-free selfTest.
+    Every published binding/skill is under these fresh isolated fixture roots.
+    Physical resource/legacy locks keep their production exclusion identity.
+    """
+    api = capability['experimental']
+    assert api['schema'] == api['hostAPI'] == 1 and api['requestMaxBytes'] == 262144
+    assert api['engines'] == ['hid-feature-fields-v1'] and api['executionReady'] is False
+    assert api['executionReadinessGaps'], 'Software fixtures cannot close qualification gates'
+    fixture = output / 'experimental-cli'
+    fixture.mkdir(mode=0o700)
+    home, skills = fixture / 'support', fixture / 'skills'
+    env = {'MSI_SCREEN_SUPPORT_HOME': str(home), 'MSI_SCREEN_AGENT_SKILLS_HOME': str(skills)}
+    early_home = fixture / 'early-must-not-exist'
+    sentinel = fixture / 'sentinel'
+    sentinel.mkdir(mode=0o700)
+    marker = fixture / 'ssh-was-launched'
+    ssh = sentinel / 'ssh'
+    ssh.write_text('#!/bin/sh\nprintf unexpected > ' + repr(str(marker)) + '\nexit 99\n')
+    ssh.chmod(0o700)
+    early_env = {**env, 'MSI_SCREEN_SUPPORT_HOME': str(early_home), 'PATH': str(sentinel) + ':/usr/bin:/bin'}
+    zero = '0' * 64
+    invalid = [
+        ('devices', 'list', '--machine', 'PRIVATE_HOST'), ('devices', 'inspect', 'prefix'),
+        ('support', 'list', '--dry-run'), ('support', 'list', '--machine=PRIVATE_HOST'),
+        ('support', 'install', '/private/PRIVATE_PATH', '--request', str(uuid.uuid4()), '--expected-digest', zero, '--expected-revision', '0', '--expected-revision', '1'),
+        ('support', 'bind', 'fixture', '--digest', zero, '--device', zero, '--expected-revision', '-1'),
+        ('support', 'bind', 'fixture', '--digest', zero, '--device', zero, '--expected-revision', '0', '--replace-binding', 'orphan'),
+        ('support', 'disable', 'fixture', '--expected-digest', 'prefix', '--expected-revision', '0'),
+        ('support', 'activate', 'fixture', '--digest', zero, '--expected-revision', '0'),
+        ('support', 'remove', 'fixture', '--digest', zero, '--expected-revision', str(2**64)),
+    ]
+    for command in invalid:
+        result = run(*command, env=early_env, success=False)
+        assert result['schema'] == 1 and result['verified'] is False and 'PRIVATE' not in json.dumps(result)
+    for text in ['{"schema":1,"kind":"plan","k\\u0069nd":"apply"}', '{"schema":1.0,"kind":"plan"}', '{"schema":1,"kind":"plan"} trailing', 'x' * 262145]:
+        run('devices', 'request', input=text, env=early_env, success=False)
+    assert not early_home.exists() and not marker.exists(), 'Parser opened state or SSH before rejecting local input'
+    assert run('devices', 'list', env={**env, 'MSI_SCREEN_SUPPORT_HOME': 'relative'}, success=False)['code'] == 'unavailableRoot'
+    assert 'Native adapters run as the user' in run('support', '--help')['stdout']
+    snapshot = run('devices', 'list', env=env)
+    assert snapshot['schema'] == 1
+    for record in snapshot['devices']:
+        assert record['displayName'] == record['kind']
+        for endpoint in record['endpoints']:
+            assert not {'address', 'registryID', 'serial', 'uuid', 'locationID'} & endpoint.keys()
+    assert run('support', 'list', env=env)['registry']['revision'] == 0
+    run('support', 'request', str(uuid.uuid4()), env=env, success=False)
+    assert run('devices', 'read', zero, env=env, success=False)['code'] == 'absentEndpoint'
+    run('support', 'receipt', str(uuid.uuid4()), env=env, success=False)
+    cases = json.loads((root / 'Tests/MSIScreenCoreTests/Fixtures/device-support-cases.json').read_text())['u4']
+    def canonical(value):
+        return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
+    def package_digest(files):
+        h = hashlib.sha256()
+        for path in sorted(files, key=lambda p: p.encode()):
+            for value in (path.encode(), files[path]):
+                h.update(len(value).to_bytes(8, 'big')); h.update(value)
+        return h.hexdigest()
+    def make_package(name, native=False, selector=None, mode='normal'):
+        directory = fixture / name
+        directory.mkdir(mode=0o700)
+        if native:
+            files = {'adapter': adapter.read_bytes(), 'fixture.json': canonical({'mode': mode})}
+            backend = {'kind': 'nativeAdapter', 'relativeExecutable': 'adapter', 'architectures': [os.uname().machine], 'minimumMacOS': '13.0'}
+        else:
+            files = {'profile.json': canonical(cases['profile'])}
+            backend = {'kind': 'profile', 'engine': 'hid-feature-fields-v1', 'relativePath': 'profile.json'}
+        manifest = {'schema': 1, 'hostAPI': 1, 'id': 'u4.fixture', 'version': '1.0.1' if native else '1.0.0',
+                    'name': 'PRIVATE_USER_LABEL', 'backend': backend, 'selectors': [selector or cases['selector']],
+                    'trustedGuards': [], 'descriptor': cases['descriptor'], 'files': {p: hashlib.sha256(b).hexdigest() for p, b in files.items()}}
+        files['manifest.json'] = canonical(manifest)
+        for path, data in files.items():
+            target = directory / path
+            target.write_bytes(data); target.chmod(0o500 if path == 'adapter' else 0o600)
+        return directory, package_digest(files)
+    adapter = fixture / 'owned-adapter-fixture'
+    build = subprocess.run(['/usr/bin/xcrun', 'swiftc', '-target', os.uname().machine + '-apple-macos13.0',
+                            str(root / 'Tests/MSIScreenCoreTests/Fixtures/AdapterFixture.swift'), '-o', str(adapter)], capture_output=True, text=True, timeout=90)
+    (fixture / 'native-build.log').write_text(build.stdout + build.stderr)
+    assert build.returncode == 0, 'Owned native fixture build failed'
+    subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', '--timestamp=none', str(adapter)], check=True, capture_output=True)
+    # Prefer a non-reserved HID endpoint so BOTH generated packages can bind
+    # without hardware requests. If no endpoint exists, validation still runs;
+    # injected reconnect/lifecycle regressions run in swift test, not a fake
+    # production-inventory environment flag.
+    selected = None
+    outcomes = {key: snapshot[key]['kind'] for key in ('displays', 'usb', 'hid')}
+    for record in snapshot['devices']:
+        if record['bindingEligibility'] not in ('durable', 'attachmentOnly'):
+            continue
+        for endpoint in record['endpoints']:
+            facts = endpoint['identity']
+            pair = (facts.get('vendorID'), facts.get('productID'))
+            if endpoint['kind'] == 'hid' and facts['transport'] in ('usb', 'bluetooth') and facts.get('usages') and all(v is not None for v in pair) \
+                    and pair not in ((0x1462, 0x3fa4), (0x046d, 0xc548), (0x24ae, 0x186a)) \
+                    and outcomes['hid'] == 'complete' and (facts['transport'] != 'usb' or outcomes['usb'] == 'complete'):
+                selected = endpoint
+                break
+        if selected:
+            break
+    selector = None
+    if selected:
+        selector = {key: selected['identity'][key] for key in ('transport', 'vendorID', 'productID', 'usages')}
+        if 'interfaceNumber' in selected['identity']:
+            selector['interfaceNumber'] = selected['identity']['interfaceNumber']
+    profile, profile_digest = make_package('profile', selector=selector)
+    native, native_digest = make_package('native', native=True, selector=selector)
+    for directory, digest in [(profile, profile_digest), (native, native_digest)]:
+        validated = run('support', 'validate', str(directory), env=env)
+        assert validated['validated'] is True and validated['deviceVerified'] is False and validated['digest'] == digest
+    diagnostic, _ = make_package('private-diagnostic', native=True, mode='privateDiagnostic')
+    failure = run('support', 'validate', str(diagnostic), env=env, success=False)
+    assert failure['code'] == 'adapterExit' and 'PRIVATE' not in json.dumps(failure)
+    damaged = profile / 'profile.json'
+    original = damaged.read_bytes()
+    damaged.write_bytes(original + b' ')
+    assert run('support', 'validate', str(profile), env=env, success=False)['code'] == 'integrityChanged'
+    damaged.write_bytes(original)
+    lifecycle = {'validatedBackends': ['profile', 'nativeAdapter'], 'executionReady': False, 'hardwareIO': False}
+    if selected:
+        endpoint_id = selected['id']
+        inspection = run('devices', 'inspect', endpoint_id, env=env)
+        assert inspection['deviceID'] == endpoint_id and 'PRIVATE' not in json.dumps(inspection)
+        prepared = run('devices', 'support-request', endpoint_id, env=env)
+        assert prepared['skill'] == 'write-addhoc-support' and 'Paste' not in prepared.get('error', '')
+        assert str(home) not in prepared['prompt'] and str(skills) not in prepared['prompt']
+        resolved = run('support', 'request', prepared['requestID'], env=env)
+        assert resolved['deviceID'] == endpoint_id and not {'endpoint', 'authentication', 'address', 'serial'} & resolved.keys()
+        installed = run('support', 'install', str(profile), '--request', prepared['requestID'], '--expected-digest', profile_digest, '--expected-revision', '0', env=env)
+        assert installed['deviceVerified'] is False and installed['after']['revision'] == 1
+        binding_id = installed['after']['bindings'][0]['id']
+        again = run('support', 'install', str(profile), '--request', prepared['requestID'], '--expected-digest', profile_digest, '--expected-revision', '1', env=env)
+        assert again['before'] == again['after'], 'Identical request/digest was not idempotent'
+        replacement_request = run('devices', 'support-request', endpoint_id, env=env)
+        native_installed = run('support', 'install', str(native), '--request', replacement_request['requestID'], '--expected-digest', native_digest,
+                               '--expected-revision', '1', '--replace-binding', binding_id, '--expected-active-digest', profile_digest, env=env)
+        revision = native_installed['after']['revision']
+        def checked_metadata(command):
+            nonlocal revision
+            before = (home / 'registry.json').read_bytes()
+            planned = run(*command, '--expected-revision', str(revision), '--dry-run', env=env)
+            assert planned['dryRun'] is True and (home / 'registry.json').read_bytes() == before
+            applied = run(*command, '--expected-revision', str(revision), env=env)
+            assert applied['after'] == planned['after'] and applied['deviceVerified'] is False
+            revision = applied['after']['revision']
+            return applied
+        checked_metadata(('support', 'disable', binding_id, '--expected-digest', native_digest))
+        checked_metadata(('support', 'activate', binding_id, '--digest', profile_digest, '--expected-active-digest', native_digest))
+        checked_metadata(('support', 'bind', 'u4.fixture', '--digest', native_digest, '--device', endpoint_id,
+                          '--replace-binding', binding_id, '--expected-active-digest', profile_digest))
+        checked_metadata(('support', 'activate', binding_id, '--digest', profile_digest, '--expected-active-digest', native_digest))
+        # A referenced (even disabled) digest cannot be removed.
+        run('support', 'remove', 'u4.fixture', '--digest', profile_digest, '--expected-revision', str(revision), '--dry-run', env=env, success=False)
+        checked_metadata(('support', 'remove', 'u4.fixture', '--digest', native_digest))
+        listed = run('support', 'list', env=env)
+        assert listed['registry']['revision'] == revision and listed['executionReady'] is False
+        assert listed['registry']['packages']['u4.fixture'] == [profile_digest]
+        inspection = run('devices', 'inspect', endpoint_id, env=env)
+        assert 'PRIVATE' not in json.dumps(inspection) and inspection['executionReady'] is False
+        # Edited skill content stops preparation, without a new private request.
+        installed_skill = skills / 'write-addhoc-support'
+        for p in (app / 'Contents/Resources/AgentSkills/write-addhoc-support').rglob('*'):
+            if p.is_file():
+                assert (installed_skill / p.relative_to(app / 'Contents/Resources/AgentSkills/write-addhoc-support')).read_bytes() == p.read_bytes()
+        edited = installed_skill / 'SKILL.md'
+        edited.write_text('PRIVATE_USER_EDIT')
+        request_names = sorted(p.name for p in (home / 'requests').iterdir())
+        assert run('devices', 'support-request', endpoint_id, env=env, success=False)['code'] == 'skillConflict'
+        assert edited.read_text() == 'PRIVATE_USER_EDIT' and sorted(p.name for p in (home / 'requests').iterdir()) == request_names
+        lifecycle.update(packagedLifecycle=True, revision=revision, endpointID=endpoint_id, noLiveReadOrApply=True)
+    else:
+        lifecycle.update(packagedLifecycle=False, limitation='No complete non-reserved passive HID endpoint; deterministic Core lifecycle regressions required')
+    # Exercise the actual CLI's disconnected metadata path on every host. Seed
+    # only owned retained metadata, never inventory or a production fake-device
+    # override. These opaque selectors cannot authorize an endpoint open.
+    disconnected = fixture / 'disconnected-support'
+    disconnected_env = {**env, 'MSI_SCREEN_SUPPORT_HOME': str(disconnected)}
+    passive = run('devices', 'list', env=disconnected_env)
+    token = lambda label: hashlib.sha256((str(uuid.uuid4()) + label).encode()).hexdigest()
+    endpoint = {'kind': 'hid', 'id': token('endpoint'), 'identity': selector or cases['selector'],
+                'physicalDomainID': token('domain'), 'incarnationID': token('incarnation')}
+    assert all(e['id'] != endpoint['id'] and e['physicalDomainID'] != endpoint['physicalDomainID']
+               for record in passive['devices'] for e in record['endpoints'])
+    for directory, digest in [(profile, profile_digest), (native, native_digest)]:
+        parent = disconnected / 'packages' / 'u4.fixture'
+        parent.mkdir(mode=0o700, exist_ok=True)
+        shutil.copytree(directory, parent / digest)
+    binding_id = 'owned-disconnected-fixture'
+    binding = {'id': binding_id, 'selector': endpoint, 'packageID': 'u4.fixture', 'digest': profile_digest, 'enabled': True}
+    metadata = {'schema': 1, 'revision': 1, 'packages': {'u4.fixture': [profile_digest, native_digest]}, 'bindings': [binding]}
+    def owned_json(path, value):
+        path.write_bytes(canonical(value)); path.chmod(0o600)
+    owned_json(disconnected / 'registry.json', metadata)
+    leases = disconnected / 'binding-leases'
+    leases.mkdir(mode=0o700)
+    owned_json(leases / (hashlib.sha256(canonical(endpoint)).hexdigest() + '.json'),
+               {'domains': ['configuration:' + endpoint['physicalDomainID']], 'controller': False, 'rapoo': False})
+    revision, disconnected_refusal = 1, None
+    completed = []
+    def owned_metadata():
+        # Compare all bytes in the fresh owned root, including registry, key,
+        # packages, leases and journals. Never follow links.
+        entries = {}
+        for path in disconnected.rglob('*'):
+            assert not path.is_symlink(), 'Unexpected link in owned disconnected state'
+            if path.is_file():
+                entries[str(path.relative_to(disconnected))] = path.read_bytes()
+        return entries
+    def disconnected_attempt(command, dry_run):
+        nonlocal disconnected_refusal
+        before = owned_metadata()
+        assert json.loads(before['registry.json'])['revision'] == revision
+        assert not any((disconnected / 'invocations').iterdir()), 'Unexpected invocation state before metadata command'
+        event = run(*command, '--expected-revision', str(revision), *(['--dry-run'] if dry_run else []),
+                    env=disconnected_env, success=None, return_event=True)
+        result = event['result']
+        if event['exitCode'] != 0:
+            # Judge the actual command, not just the earlier passive snapshot:
+            # a required source may become partial during either lease-time capture.
+            assert event['exitCode'] == 1 and command[1] in ('disable', 'activate') and result.get('schema') == 1 \
+                and result.get('code') == 'inventoryIncomplete' and result.get('verified') is False, event
+            assert owned_metadata() == before, 'Refused metadata command changed owned bytes'
+            assert not any((disconnected / 'invocations').iterdir()), 'Refused metadata command left invocation state'
+            disconnected_refusal = {'code': result['code'], 'exitCode': event['exitCode'], 'command': command[1],
+                'phase': 'dry-run' if dry_run else 'apply', 'revisionUnchanged': revision,
+                'registrySHA256': hashlib.sha256(before['registry.json']).hexdigest(),
+                'ownedMetadataFilesUnchanged': len(before), 'noInvocationArtifacts': True,
+                'initialSources': {key: passive[key] for key in ('displays', 'usb', 'hid')}}
+            return None
+        if dry_run:
+            assert result['dryRun'] is True and owned_metadata() == before, 'Dry-run changed owned metadata'
+        return result
+    for command in [('support', 'disable', binding_id, '--expected-digest', profile_digest),
+                    ('support', 'activate', binding_id, '--digest', native_digest, '--expected-active-digest', profile_digest),
+                    ('support', 'activate', binding_id, '--digest', profile_digest, '--expected-active-digest', native_digest),
+                    ('support', 'remove', 'u4.fixture', '--digest', native_digest)]:
+        planned = disconnected_attempt(command, True)
+        if planned is None:
+            break
+        applied = disconnected_attempt(command, False)
+        if applied is None:
+            break
+        assert applied['after'] == planned['after'] and applied['deviceVerified'] is False
+        revision = applied['after']['revision']
+        completed.append(command[1])
+    if disconnected_refusal is None:
+        before = owned_metadata()
+        refused = run('support', 'bind', 'u4.fixture', '--digest', profile_digest, '--device', endpoint['id'],
+                      '--expected-revision', str(revision), env=disconnected_env, success=False)
+        assert refused['code'] == 'absentEndpoint' and owned_metadata() == before
+    listed = run('support', 'list', env=disconnected_env)
+    assert listed['registry'] == json.loads((disconnected / 'registry.json').read_bytes())
+    assert listed['registry']['revision'] == revision and listed['executionReady'] is False
+    if disconnected_refusal is None:
+        assert listed['registry']['packages']['u4.fixture'] == [profile_digest]
+    assert not any((disconnected / 'invocations').iterdir()), 'Disconnected invocation scratch leaked'
+    lifecycle.update(disconnectedMetadataLifecycle=disconnected_refusal is None, disconnectedRevision=revision,
+                     disconnectedCompletedSteps=completed, noLiveReadOrApply=True)
+    if disconnected_refusal is not None:
+        lifecycle.update(disconnectedMetadataRefusal=disconnected_refusal,
+            disconnectedLimitation='Actual CLI safely refused incomplete required passive inventory; no complete disconnected lifecycle evidence for this attempt. Deterministic disconnected execution remains in --support-fixture/Core tests, not fabricated complete OS outcomes.')
+    assert not any((home / 'invocations').iterdir()), 'Invocation scratch leaked'
+    (fixture / 'summary.json').write_text(json.dumps(lifecycle, indent=2) + '\n')
+    return lifecycle
 
 
 def read_state(*command, timeout=40):
@@ -172,7 +481,7 @@ def read_state(*command, timeout=40):
         except RuntimeError as error:
             payload = error.args[0] if error.args else None
             if not isinstance(payload, dict) or payload.get('verified') is not False \
-                    or payload.get('error') != 'Another msi-screen process is using the monitor':
+                    or payload.get('error') != 'busy':
                 raise
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -227,7 +536,7 @@ def offline_machine_registry():
     env = {'MSI_SCREEN_MACHINE_CONFIG': str(fixture)}
     def machine(*command, **kwargs):
         return run('machine', *command, env=env, **kwargs)
-    empty = {'schemaVersion': 1, 'machines': []}
+    empty = {'schemaVersion': 3, 'machines': []}
     assert machine('list') == empty
     local = ('add', 'local', '--name', 'Local fixture', '--platform', 'macos', '--input', 'usbc', '--local')
     preview = machine(*local, '--dry-run')
@@ -235,7 +544,26 @@ def offline_machine_registry():
     assert len(preview['after']['machines']) == 1 and not fixture.exists()
     created = machine(*local)
     assert created['verified'] and machine('list') == created['after']
+    assert created['after']['machines'][0]['access'] == 'local'
+    legacy = {'schemaVersion': 1, 'machines': [
+        {key: value for key, value in record.items() if key != 'access'}
+        for record in created['after']['machines']]}
+    legacy_bytes = json.dumps(legacy).encode()
+    fixture.write_bytes(legacy_bytes)
+    assert machine('list') == created['after'], 'Legacy machine access was not normalized'
+    assert fixture.read_bytes() == legacy_bytes, 'Reading legacy machine data rewrote it'
+    machine('update', 'local', '--name', 'Migrated local fixture')
+    assert json.loads(fixture.read_bytes())['schemaVersion'] == 3
     machine('add', 'linux', '--name', 'Linux fixture', '--platform', 'linux', '--input', 'dp', '--host', 'fixture-host')
+    machine('usb-upstream', 'linux')
+    discovered = machine('add', 'discovered', '--name', 'Discovered fixture', '--platform', 'linux',
+                         '--input', 'none', '--host', 'user@host.example.ts.net', '--ssh-transport', 'tailscale')
+    assert discovered['after']['usbUpstreamMachineID'] == 'linux', 'New SSH machine replaced the USB-B assignment'
+    remote = next(record for record in discovered['after']['machines'] if record['id'] == 'discovered')
+    assert remote['sshTransport'] == 'tailscale' and remote.get('input') is None
+    assert machine('usb-upstream', 'discovered', '--dry-run')['after']['usbUpstreamMachineID'] == 'discovered'
+    assert machine('list') == discovered['after'], 'USB-B dry run persisted a change'
+    machine('remove', 'discovered')
     stable = machine('list')
     for command in [
         local,
@@ -247,6 +575,7 @@ def offline_machine_registry():
         ('update', 'linux'),
         ('remove', 'linux', '--name', 'Unexpected'),
         ('fullscreen', 'missing', '--dry-run'),
+        ('usb-upstream', 'missing'),
     ]:
         failure = machine(*command, success=False)
         assert failure['verified'] is False and failure.get('before') is None
@@ -258,6 +587,16 @@ def offline_machine_registry():
     assert machine('remove', 'linux', '--dry-run')['after']['machines'] == stable['machines'][:1]
     assert machine('list') == stable, 'Remove dry-run changed the registry'
     machine('remove', 'linux')
+    video = machine('add', 'video', '--name', 'Video fixture', '--platform', 'linux', '--input', 'dp', '--video-only')
+    record = next(record for record in video['after']['machines'] if record['id'] == 'video')
+    assert record['access'] == 'video-only' and record['input'] == 'dp' and record.get('host') is None
+    unassigned = machine('update', 'video', '--input', 'none')
+    record = next(record for record in unassigned['after']['machines'] if record['id'] == 'video')
+    assert record['access'] == 'video-only' and record.get('input') is None
+    failure = machine('fullscreen', 'video', '--dry-run', success=False)
+    assert failure['verified'] is False and failure.get('before') is None
+    assert machine('list') == unassigned['after'], 'Unassigned video route changed the registry'
+    machine('remove', 'video')
     machine('remove', 'local')
     assert machine('list') == empty
 
@@ -396,11 +735,7 @@ def offline():
             assert 'msi-screen' in info['CFBundleURLTypes'][0]['CFBundleURLSchemes']
             assert binary == app / 'Contents/MacOS/msi-screen', 'Smoke must run the packaged CLI'
             assert (app / 'Contents/Resources/LICENSE').read_text() == (root / 'LICENSE').read_text(), 'Packaged license is missing or stale'
-            skill = root / 'skills/msi-screen-control'
-            bundled_skill = app / 'Contents/Resources/AgentSkills/msi-screen-control'
-            for source in skill.rglob('*'):
-                if source.is_file():
-                    assert (bundled_skill / source.relative_to(skill)).read_bytes() == source.read_bytes(), 'Bundled agent skill is missing or stale'
+            summary['agentSkillResources'] = verify_skill_resources(app)
             updates = json.loads((root / 'config/updates.json').read_text())
             assert info['SUFeedURL'] == updates['feedURL']
             assert info['SUPublicEDKey'] == updates['publicKey']
@@ -422,6 +757,7 @@ def offline():
                     assert bundled_sparkle or library.startswith(('/System/Library/', '/usr/lib/', '@rpath/libswift')), library
             subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)], check=True)
             summary['app'] = str(app)
+            summary['experimentalCLI'] = verify_experimental_cli(capability, app)
             if args.dmg:
                 for executable in (binary, app / 'Contents/MacOS' / info['CFBundleExecutable']):
                     subprocess.run(['lipo', str(executable), '-verify_arch', 'arm64', 'x86_64'], check=True)
@@ -471,6 +807,344 @@ def offline():
     return 0 if summary['passed'] else 1
 
 
+def support_fixture_health_status(value, panel_requested, now_milliseconds=None):
+    """Independent initialization, ongoing background-safety and presentation gates.
+
+    Later foreground changes between other apps are normal, not fixture focus theft.
+    Occlusion/Space/tab observations explain state only; they never authorize recovery.
+    """
+    inconclusive = {'backgroundInitialization': 'INCONCLUSIVE', 'currentBackgroundSafety': 'INCONCLUSIVE',
+                    'panelReadiness': 'INCONCLUSIVE', 'ready': False}
+    if not value:
+        return inconclusive
+    now = int(time.time() * 1000) if now_milliseconds is None else now_milliseconds
+    age = now - value.get('checkedAtMilliseconds', 0)
+    fresh = 0 <= age <= 3000
+    pid, bundle = value.get('pid'), value.get('bundleID')
+    def external(sample):
+        return (isinstance(sample, dict) and type(sample.get('pid')) is int and sample['pid'] > 0
+                and sample['pid'] != pid and (not bundle or sample.get('bundleID') != bundle))
+    before, after, current = (value.get('frontmost' + name) for name in ('Before', 'After', 'Current'))
+    initialization = (type(pid) is int and pid > 0 and value.get('initializationComplete') is True
+        and value.get('appFinishedLaunching') is True and value.get('initializationBackgroundSafe') is True
+        and value.get('foregroundPreservation') == 'OBSERVED_UNCHANGED' and external(before) and external(after) and before == after)
+    background = (fresh and type(pid) is int and pid > 0 and external(current)
+        and value.get('currentBackgroundSafety') == 'PASS' and value.get('appIsActive') is False
+        and value.get('panelIsKeyWindow') is False and value.get('backgroundViolationObserved') is False)
+    presentation = (fresh and value.get('panelIsVisible') is panel_requested
+        and (not panel_requested or (value.get('appIsHidden') is False and value.get('panelIsMiniaturized') is False)))
+    return {'backgroundInitialization': 'PASS' if initialization else 'INCONCLUSIVE',
+            'currentBackgroundSafety': 'PASS' if background else 'INCONCLUSIVE',
+            'panelReadiness': 'PASS' if presentation else 'INCONCLUSIVE',
+            'ready': initialization and background and presentation}
+
+
+def support_fixture():
+    """One owned file-only runtime; no Cua/HTTP/AppleScript or live stages here."""
+    global binary
+    label = 'ISOLATED NON-HARDWARE SUPPORT FIXTURE — not device qualification'
+    action = args.support_fixture_action or ('prepare' if args.gui else 'exercise')
+
+    def canonical(value):
+        return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
+
+    def private_json(path, value):
+        if path.exists() or path.is_symlink():
+            info = path.lstat()
+            assert not path.is_symlink() and info.st_uid == os.getuid() and info.st_nlink == 1
+        temporary = path.with_name('.owned-' + uuid.uuid4().hex)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, canonical(value)); os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, path)
+
+    def checked_root(path):
+        assert path.is_absolute() and path.parent == Path('/private/tmp') and path == path.resolve()
+        assert path.name.startswith('msi-support-fixture-')
+        uuid.UUID(path.name.removeprefix('msi-support-fixture-'))
+        info = path.lstat()
+        assert info.st_uid == os.getuid() and info.st_mode & 0o777 == 0o700 and not path.is_symlink()
+        receipt_path = path / 'receipt.json'
+        info = receipt_path.lstat()
+        assert info.st_uid == os.getuid() and info.st_nlink == 1 and info.st_mode & 0o777 == 0o600 and not receipt_path.is_symlink()
+        receipt = json.loads(receipt_path.read_text())
+        assert receipt['owner'] == 'msi-screen-verifier-support-v1' and receipt['schema'] == 1
+        assert int(time.time() * 1000) < receipt['expiresAtMilliseconds']
+        assert receipt['bundleIdentifier'] == 'com.danielsivan.msi-screen.support-fixture.' + receipt['nonce']
+        return receipt
+
+    def digest_package(files):
+        h = hashlib.sha256()
+        for name in sorted(files):
+            for part in (name.encode(), files[name]):
+                h.update(len(part).to_bytes(8, 'big')); h.update(part)
+        return h.hexdigest()
+
+    if args.support_fixture_root:
+        fixture = args.support_fixture_root
+        receipt = checked_root(fixture)
+        handoff = json.loads((fixture / 'handoff.json').read_text())
+        assert handoff['nonce'] == receipt['nonce'] and handoff['fixtureRoot'] == str(fixture)
+    else:
+        assert action in ('prepare', 'exercise', 'serve')
+        source_app = args.app.resolve()
+        assert source_app.is_dir() and source_app.suffix == '.app'
+        subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(source_app)], check=True)
+        nonce = str(uuid.uuid4())
+        fixture = Path('/private/tmp') / ('msi-support-fixture-' + str(uuid.uuid4()))
+        fixture.mkdir(mode=0o700)
+        for name in ('skills', 'leases'):
+            (fixture / name).mkdir(mode=0o700)
+        app = fixture / 'MSI Support Fixture.app'
+        shutil.copytree(source_app, app, symlinks=True)
+        bundle_id = 'com.danielsivan.msi-screen.support-fixture.' + nonce
+        plist_path = app / 'Contents/Info.plist'
+        info = plistlib.loads(plist_path.read_bytes()); info['CFBundleIdentifier'] = bundle_id
+        info['CFBundleDisplayName'] = 'MSI isolated non-hardware support fixture'
+        plist_path.write_bytes(plistlib.dumps(info))
+        subprocess.run(['/usr/bin/codesign', '--force', '--deep', '--sign', '-', '--timestamp=none', str(app)], check=True, capture_output=True)
+        subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)], check=True)
+        adapter = fixture / 'owned-adapter'
+        build = subprocess.run(['/usr/bin/xcrun', 'swiftc', '-target', os.uname().machine + '-apple-macos13.0',
+                                str(root / 'Tests/MSIScreenCoreTests/Fixtures/AdapterFixture.swift'), '-o', str(adapter)], capture_output=True, text=True, timeout=120)
+        (fixture / 'native-build.log').write_text(build.stdout + build.stderr)
+        assert build.returncode == 0, 'Owned fixture compiler failed'
+        subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', '--timestamp=none', str(adapter)], check=True, capture_output=True)
+        cases = json.loads((root / 'Tests/MSIScreenCoreTests/Fixtures/device-support-cases.json').read_text())['u5']
+        packages = {}
+        for backend in ('profile', 'native'):
+            package = fixture / ('package-' + backend); package.mkdir(mode=0o700)
+            if backend == 'profile':
+                files = {'profile.json': canonical(cases['profile'])}
+                contract = {'kind': 'profile', 'engine': 'hid-feature-fields-v1', 'relativePath': 'profile.json'}
+            else:
+                files = {'adapter': adapter.read_bytes(), 'fixture.json': canonical({'mode': 'normal',
+                    'statePath': str(fixture / 'native-state.json'), 'marker': str(fixture / 'native-marker.json'), 'applyDelayMilliseconds': 1500})}
+                contract = {'kind': 'nativeAdapter', 'relativeExecutable': 'adapter', 'architectures': [os.uname().machine], 'minimumMacOS': '13.0'}
+            manifest = {'schema': 1, 'hostAPI': 1, 'id': 'u5.fixture', 'version': '1.0.0' if backend == 'profile' else '1.0.1',
+                        'name': label, 'backend': contract, 'selectors': [cases['selector']], 'trustedGuards': [],
+                        'descriptor': cases['descriptor'], 'files': {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}
+            files['manifest.json'] = canonical(manifest)
+            for name, data in files.items():
+                target = package / name; target.write_bytes(data); target.chmod(0o500 if name == 'adapter' else 0o600)
+            packages[backend] = {'path': str(package), 'digest': digest_package(files)}
+        receipt = {'schema': 1, 'owner': 'msi-screen-verifier-support-v1', 'nonce': nonce,
+                   'expiresAtMilliseconds': int(time.time() * 1000) + 6 * 60 * 60 * 1000,
+                   'packageDigests': sorted(p['digest'] for p in packages.values()),
+                   'adapterDigest': hashlib.sha256(adapter.read_bytes()).hexdigest(), 'bundleIdentifier': bundle_id}
+        private_json(fixture / 'receipt.json', receipt)
+        private_json(fixture / 'attachment.json', {'schema': 1, 'attachment': 1, 'connected': True})
+        private_json(fixture / 'reports.json', cases['reports'])
+        private_json(fixture / 'native-state.json', cases['nativeState'])
+        private_json(fixture / 'machines.json', {'schemaVersion': 1, 'machines': []})
+        cli = app / 'Contents/MacOS/msi-screen'
+        handoff = {'schema': 1, 'label': label, 'nonce': nonce, 'fixtureRoot': str(fixture), 'fixtureApp': str(app),
+                   'cli': str(cli), 'appExecutable': str(app / 'Contents/MacOS/MSIScreenMenu'), 'bundleIdentifier': bundle_id,
+                   'sourceApp': str(source_app), 'sourceCLIHash': hashlib.sha256((source_app / 'Contents/MacOS/msi-screen').read_bytes()).hexdigest(),
+                   'fixtureCLIHash': hashlib.sha256(cli.read_bytes()).hexdigest(),
+                   'sourceMenuHash': hashlib.sha256((source_app / 'Contents/MacOS/MSIScreenMenu').read_bytes()).hexdigest(),
+                   'fixtureMenuHash': hashlib.sha256((app / 'Contents/MacOS/MSIScreenMenu').read_bytes()).hexdigest(),
+                   'verifierHash': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), 'packages': packages,
+                   'servePanelInitialization': 'serve alone passes --show-controls after launch callback: fixture-only panel cannot become key/main; no activation/key-front/input. Exercise stays hidden. Initialization before/settled-after proof, fresh current inactive/non-key/nonfixture-frontmost safety, and requested panel visibility are separate gates. Later foreground movement between other apps is allowed. Missing/contradictory evidence is INCONCLUSIVE; passive presentation/tab events do not attribute input or authorize recovery.',
+                   'environment': {'MSI_SCREEN_SUPPORT_HOME': str(fixture / 'support'), 'MSI_SCREEN_AGENT_SKILLS_HOME': str(fixture / 'skills')},
+                   'gui': 'INCONCLUSIVE: external installed-companion background-only action/result QA pending; no GUI driving or focus performed',
+                   'controls': ['devices-tab', 'devices-inventory', 'devices-refresh', 'device-row-ID', 'device-write-support-ID',
+                                'device-read-ID', 'device-capability-ID-level-value', 'device-apply-ID-level', 'device-receipt', 'device-support-error'],
+                   'clipboard': 'External QA must capture triggering Copy action, result and independent clipboard; restore only if content/change count still owned.'}
+        for operation in ('serve', 'health', 'stop'):
+            handoff[operation + 'Command'] = shlex.join([sys.executable, str(root / 'scripts/verify.py'), '--support-fixture',
+                '--support-fixture-action', operation, '--support-fixture-root', str(fixture)])
+        private_json(fixture / 'handoff.json', handoff)
+        checked_root(fixture)
+
+    binary = Path(handoff['cli'])
+    assert hashlib.sha256(binary.read_bytes()).hexdigest() == handoff['fixtureCLIHash'], 'Prepared fixture CLI changed'
+    assert hashlib.sha256(Path(handoff['appExecutable']).read_bytes()).hexdigest() == handoff['fixtureMenuHash'], 'Prepared fixture menu changed'
+    assert hashlib.sha256(Path(__file__).read_bytes()).hexdigest() == handoff['verifierHash'], 'Prepared fixture verifier changed; prepare a new handoff'
+    environment = handoff['environment']
+    flags = ('--support-fixture-receipt', str(fixture / 'receipt.json'), '--support-fixture-nonce', receipt['nonce'])
+    def cli(*command, **options):
+        return run(*command, *flags, env=environment, **options)
+    def health():
+        path = fixture / 'app-health.json'
+        if not path.exists():
+            return None
+        value = json.loads(path.read_text())
+        assert uuid.UUID(value['nonce']) == uuid.UUID(receipt['nonce']) and value['bundleID'] == receipt['bundleIdentifier'] and value['label'] == label
+        return value
+    def health_status(value):
+        return support_fixture_health_status(value, handoff.get('panelRequested', False))
+    def wait_health(process, revision=None):
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            assert process.poll() is None, 'Owned app exited; inspect app.log'
+            value = health()
+            if value and value.get('backgroundViolationObserved'):
+                raise RuntimeError('Owned fixture acquired active/key status; no foreground restoration or retry will be attempted')
+            if value and value['pid'] == process.pid and health_status(value)['ready'] and not value['busy'] and value.get('metadataRevision', -1) >= (0 if revision is None else revision):
+                return value
+            time.sleep(0.1)
+        raise RuntimeError('Owned app health/reload checkpoint unavailable')
+    if action == 'health':
+        value = health()
+        alive = False
+        if value:
+            image = subprocess.run(['/bin/ps', '-p', str(value['pid']), '-o', 'comm='], capture_output=True, text=True, timeout=5)
+            arguments = subprocess.run(['/bin/ps', '-ww', '-p', str(value['pid']), '-o', 'args='], capture_output=True, text=True, timeout=5)
+            words = arguments.stdout.split()
+            alive = (image.returncode == arguments.returncode == 0 and image.stdout.strip() == handoff['appExecutable']
+                     and '--support-fixture-receipt' in words and str(fixture / 'receipt.json') in words
+                     and '--support-fixture-nonce' in words and receipt['nonce'] in words)
+        status = health_status(value)
+        healthy = alive and status['ready']
+        print(json.dumps({'label': label, 'root': str(fixture), 'healthy': healthy, 'ownedProcessAlive': alive,
+            **status, 'reportedState': value, 'gui': handoff['gui']}))
+        return 0 if healthy else 2
+    if action == 'stop':
+        private_json(fixture / 'stop-request.json', {'nonce': receipt['nonce']})
+        print(json.dumps({'label': label, 'stopRequested': True, 'nativeTerminationGate': True, 'signalsSent': False})); return 0
+    passive = cli('devices', 'list')
+    assert len(passive['devices']) == 1
+    endpoint = passive['devices'][0]['endpoints'][0]['id']
+    handoff['deviceID'] = endpoint
+    handoff['controls'] = [s.replace('ID', endpoint) for s in handoff['controls']]
+    private_json(fixture / 'handoff.json', handoff)
+    if action == 'prepare':
+        print(json.dumps({'label': label, 'handoff': str(fixture / 'handoff.json'), 'gui': handoff['gui']}, indent=2))
+        return 2 if args.gui else 0
+
+    handoff['panelRequested'] = action == 'serve'
+    private_json(fixture / 'handoff.json', handoff)
+    app_log = (fixture / 'app.log').open('wb')
+    process = subprocess.Popen([handoff['appExecutable'], '--support-fixture-receipt', str(fixture / 'receipt.json'),
+                                '--support-fixture-nonce', receipt['nonce'], '--verification-owner', receipt['nonce'],
+                                '--verification-window-file', str(fixture / 'window.json'), '--supervisor', str(os.getpid()),
+                                *(['--show-controls'] if action == 'serve' else [])],
+                               env={**os.environ, **environment}, stdout=app_log, stderr=subprocess.STDOUT)
+    try:
+        first_health = wait_health(process)
+        health_check = subprocess.run([sys.executable, str(root / 'scripts/verify.py'), '--support-fixture',
+            '--support-fixture-action', 'health', '--support-fixture-root', str(fixture)], capture_output=True, text=True, timeout=20)
+        private_json(fixture / 'live-health-check.json', {'exitCode': health_check.returncode, 'stdout': health_check.stdout, 'stderr': health_check.stderr})
+        assert health_check.returncode == 0 and json.loads(health_check.stdout)['healthy'], 'Owned live health command failed'
+        if action == 'exercise':
+            assert first_health['copyDetail'] == 'Install skill and copy request'
+        handoff['appPID'] = process.pid; handoff['verifierPID'] = os.getpid()
+        private_json(fixture / 'handoff.json', handoff)
+        print(json.dumps({'label': label, 'handoff': str(fixture / 'handoff.json'), 'health': first_health}), flush=True)
+        if action == 'serve':
+            deadline = time.monotonic() + 3600
+            while time.monotonic() < deadline and process.poll() is None:
+                stop = fixture / 'stop-request.json'
+                if stop.exists() and json.loads(stop.read_text()).get('nonce') == receipt['nonce'] and not (health() or {}).get('busy', True):
+                    break
+                time.sleep(0.25)
+            return 2  # Serving/preparation never manufactures a GUI PASS.
+
+        packages = handoff['packages']
+        prepared = cli('devices', 'support-request', endpoint)
+        assert label not in prepared['prompt'] and str(fixture) not in prepared['prompt']
+        assert '$write-addhoc-support' in prepared['prompt']
+        assert not (fixture / 'native-marker.json.events').exists() and not (fixture / 'profile-writes').exists(), 'Copy preparation dispatched a backend'
+        for kind in ('profile', 'native'):
+            result = cli('support', 'validate', packages[kind]['path'])
+            assert result['digest'] == packages[kind]['digest'] and result['deviceVerified'] is False
+        revision = 0; binding = None; receipts = []
+        cases = json.loads((root / 'Tests/MSIScreenCoreTests/Fixtures/device-support-cases.json').read_text())['u5']
+        for kind in ('profile', 'native'):
+            request = cli('devices', 'support-request', endpoint)
+            install_args = ['support', 'install', packages[kind]['path'], '--request', request['requestID'],
+                            '--expected-digest', packages[kind]['digest'], '--expected-revision', str(revision)]
+            if binding:
+                install_args += ['--replace-binding', binding['id'], '--expected-active-digest', binding['digest']]
+            installed = cli(*install_args)
+            revision = installed['after']['revision']; binding = installed['after']['bindings'][0]
+            assert installed['deviceVerified'] is False
+            live_health = wait_health(process, revision)
+            assert live_health['pid'] == first_health['pid'], 'Activation restarted the app'
+            assert live_health['copyDetail'] == 'Copy support request'
+            for operation in cases['operations']:
+                before = cli('devices', 'read', endpoint)
+                plan = cli('devices', 'request', input=json.dumps({'schema': 1, 'kind': 'plan', 'observation': before, 'operation': operation}))
+                result = cli('devices', 'request', input=json.dumps({'schema': 1, 'kind': 'apply', 'plan': plan}))
+                assert result['verified'] and result['outcome'] == 'verified'
+                independent = cli('devices', 'read', endpoint)
+                assert independent['values'][operation['capabilityID']] == operation['target']
+                receipt_result = cli('support', 'receipt', result['operationID'])
+                assert receipt_result == result
+                writes = (fixture / ('profile-writes' if kind == 'profile' else 'native-marker.json.writes')).read_bytes()
+                replay = cli('devices', 'request', input=json.dumps({'schema': 1, 'kind': 'apply', 'plan': plan}))
+                assert replay == result
+                assert writes == (fixture / ('profile-writes' if kind == 'profile' else 'native-marker.json.writes')).read_bytes()
+                receipts.append({'backend': kind, 'capability': operation['capabilityID'], 'operationID': result['operationID']})
+        # Serial-less disconnect/rebind never runs a backend or reinstalls a package.
+        trace = (fixture / 'native-marker.json.events').read_bytes()
+        private_json(fixture / 'attachment.json', {'schema': 1, 'attachment': 1, 'connected': False})
+        cli('devices', 'read', endpoint, success=False)
+        private_json(fixture / 'attachment.json', {'schema': 1, 'attachment': 2, 'connected': True})
+        new_endpoint = cli('devices', 'list')['devices'][0]['endpoints'][0]['id']
+        assert new_endpoint != endpoint
+        planned = cli('support', 'bind', 'u5.fixture', '--digest', packages['native']['digest'], '--device', new_endpoint,
+                      '--expected-revision', str(revision), '--dry-run')
+        assert planned['dryRun'] and planned['before']['revision'] == revision
+        rebound = cli('support', 'bind', 'u5.fixture', '--digest', packages['native']['digest'], '--device', new_endpoint,
+                      '--expected-revision', str(revision))
+        revision = rebound['after']['revision']
+        assert len(rebound['after']['bindings']) == 2 and binding['id'] in rebound['preservedBindingIDs']
+        assert trace == (fixture / 'native-marker.json.events').read_bytes()
+        assert cli('devices', 'read', new_endpoint)['identity']['deviceID'] == new_endpoint
+        # Genuine installer ownership: install an older bundled tree with its CLI,
+        # then upgrade through the current bundle, without fabricating a receipt.
+        old_app = fixture / 'Previous Fixture.app'; shutil.copytree(Path(handoff['fixtureApp']), old_app, symlinks=True)
+        old_skill = old_app / 'Contents/Resources/AgentSkills/write-addhoc-support/SKILL.md'
+        old_skill.write_bytes(old_skill.read_bytes() + b'\nOwned previous fixture variant.\n')
+        subprocess.run(['/usr/bin/codesign', '--force', '--deep', '--sign', '-', '--timestamp=none', str(old_app)], check=True, capture_output=True)
+        # Current installed tree is already owned. The old bundle becomes an
+        # explicit managed version, and the current bundle upgrades it back.
+        current_cli = binary; binary = old_app / 'Contents/MacOS/msi-screen'
+        try:
+            assert cli('devices', 'support-request', new_endpoint)['skillStatus'] == 'upgraded'
+        finally:
+            binary = current_cli
+        assert cli('devices', 'support-request', new_endpoint)['skillStatus'] == 'upgraded'
+        installed_skill = fixture / 'skills/write-addhoc-support/SKILL.md'
+        edited = installed_skill.read_bytes() + b'\nUser-edited fixture content must survive.\n'
+        installed_skill.write_bytes(edited)
+        cli('devices', 'support-request', new_endpoint, success=False)
+        assert installed_skill.read_bytes() == edited
+        ordinary = run('support', 'list', env=environment)
+        assert ordinary['executionReady'] is False and ordinary['executionReadinessGaps']
+        # An invalid explicit nonce refuses before live factories, never falls back.
+        run('devices', 'list', '--support-fixture-receipt', str(fixture / 'receipt.json'), '--support-fixture-nonce', str(uuid.uuid4()), env=environment, success=False)
+        final_health = wait_health(process, revision)
+        assert final_health['pid'] == process.pid
+        assert not list((fixture / 'support/invocations').iterdir()), 'Invocation copies leaked'
+        summary = {'label': label, 'cliLifecycle': 'PASS', 'typedBackendOperations': receipts, 'seriallessRebind': True,
+                   'managedSkillUpgradeAndEditedConflict': True, 'appStayedOpenAndReloaded': True, 'appPID': process.pid,
+                   'productionReadiness': False, 'gui': handoff['gui'], 'clipboard': 'INCONCLUSIVE: real button/clipboard not driven',
+                   'physicalPanel': 'NOT TESTED', 'nativeIntelMacOS13AndResponsibleClient': 'UNVERIFIED'}
+        private_json(fixture / 'summary.json', summary)
+        print(json.dumps({'supportFixture': summary, 'evidence': str(fixture)}, indent=2), flush=True)
+        return 0
+    finally:
+        # Request native termination of only this receipt-owned child. Its real
+        # main-actor gate, not a delayed health snapshot, waits for setter cleanup.
+        if process.poll() is None:
+            private_json(fixture / 'stop-request.json', {'nonce': receipt['nonce']})
+            try:
+                process.wait(timeout=130)
+            except subprocess.TimeoutExpired as error:
+                private_json(fixture / 'cleanup-pending.json', {'nonce': receipt['nonce'], 'pid': process.pid, 'reason': 'nativeTerminationPending'})
+                raise RuntimeError('Owned fixture did not finish native termination; no signal/retry sent. Parent cleanup handoff required.') from error
+        app_log.close()
+        private_json(fixture / 'terminal.json', {'nonce': receipt['nonce'], 'pid': process.pid, 'exitCode': process.returncode,
+                     'ownedAppStopped': process.poll() is not None, 'clipboardTouchedByVerifier': False})
+
+
+if args.support_fixture:
+    sys.exit(support_fixture())
 if args.offline:
     sys.exit(offline())
 
@@ -503,9 +1177,20 @@ def gui_snapshot(label, screenshot=False, window=None):
     # Labels may contain configured machine names; keep evidence inside output.
     label = label.replace('/', '_').replace('\\', '_')
     extra = {'screenshot_out_file': str(output / (label + '.png'))} if screenshot else {'include_screenshot': False}
-    result = cua.call('get_window_state', pid=gui_pid, window_id=gui_window if window is None else window, **extra)
-    (output / (label + '.json')).write_text(json.dumps(result, indent=2))
-    return result
+    for attempt in range(5):
+        result = cua.call('get_window_state', pid=gui_pid, window_id=gui_window if window is None else window, **extra)
+        (output / (label + '.json')).write_text(json.dumps(result, indent=2))
+        if not screenshot or (result.get('screenshot_width', 0) >= 10 and result.get('screenshot_height', 0) >= 10):
+            return result
+        # Panel animation can briefly produce a nominally valid 1x1 image.
+        # It is not usable visual evidence or a basis for scroll geometry.
+        event = {'action': ['gui-recapture', label, attempt + 1],
+                 'width': result.get('screenshot_width'), 'height': result.get('screenshot_height')}
+        with (output / 'actions.jsonl').open('a') as f:
+            f.write(json.dumps(event) + '\n')
+        if attempt < 4:
+            time.sleep(0.15)
+    raise RuntimeError('GUI screenshot remained too small after bounded recapture: ' + label)
 
 
 def gui_menu_bar(label):
@@ -728,6 +1413,7 @@ def gui_relaunch_updated_fixture(bundle_id):
         try:
             if gui_owned and owns_gui_process():
                 try:
+                    gui_wait_for_quit_readiness()
                     gui_named_menu('App actions')
                     gui_click('Quit', 'AXMenuItem')
                 except Exception:
@@ -818,27 +1504,42 @@ def gui_wait_across_poll(label):
         time.sleep(min(10, deadline - now))
 
 
-def gui_click(label=None, role=None, occurrence=0, before_action=None):
+def gui_identifier_elements(state, identifier, role='AXButton'):
+    """Resolve Cua's tree-only AX identifiers to this snapshot's action tokens."""
+    indices = [int(match.group(1)) for line in state.get('tree_markdown', '').splitlines()
+               if re.search(r'\bid=' + re.escape(identifier) + r'(?=\s|\])', line)
+               and (match := re.search(r'^\s*- \[(\d+)\]', line))]
+    assert len(indices) == len(set(indices)), 'Duplicate AX identifier: ' + identifier
+    matches = [element for element in state.get('elements', [])
+               if element['element_index'] in indices and element.get('role') == role]
+    assert len(matches) <= 1, 'Ambiguous ' + role + ' identifier: ' + identifier
+    return matches
+
+
+def gui_click(label=None, role=None, occurrence=0, before_action=None, identifier=None):
     # SwiftUI may still show the previous message while an asynchronous SSH
     # read disables its buttons. Wait for an actionable target, not stale text.
     deadline = time.monotonic() + 50
     while True:
-        state = gui_snapshot('before-' + (label or role), screenshot=True)
-        matches = [e for e in state['elements']
+        state = gui_snapshot('before-' + (label or identifier or role), screenshot=True)
+        elements = gui_identifier_elements(state, identifier, role=role or 'AXButton') if identifier else state['elements']
+        if identifier:
+            assert len(elements) <= 1, 'Ambiguous GUI control: ' + identifier
+        matches = [e for e in elements
                    if e.get('enabled', True)
                    and (label is None or e.get('label', '') == label) and (role is None or e.get('role') == role)]
         if len(matches) > occurrence:
             break
         if time.monotonic() >= deadline:
-            raise RuntimeError(f'GUI control unavailable: {label or role}')
+            raise RuntimeError(f'GUI control unavailable: {label or identifier or role}')
         time.sleep(0.25)
     if before_action is not None:
         before_action()
     result = cua.call('click', pid=gui_pid, window_id=gui_window,
                       element_token=matches[occurrence]['element_token'], delivery_mode='background')
     with (output / 'actions.jsonl').open('a') as f:
-        f.write(json.dumps({'action': ['gui-click', label or role, occurrence], 'result': result}) + '\n')
-    print(json.dumps({'action': ['gui-click', label or role, occurrence], 'result': result}), flush=True)
+        f.write(json.dumps({'action': ['gui-click', label or identifier or role, occurrence], 'result': result}) + '\n')
+    print(json.dumps({'action': ['gui-click', label or identifier or role, occurrence], 'result': result}), flush=True)
     if result.get('effect') == 'refused':
         raise RuntimeError(result)
 
@@ -859,9 +1560,95 @@ def gui_ready(label):
     raise RuntimeError('GUI did not finish reading back monitor state')
 
 
+def gui_inspect_layout_preview(registry):
+    """Exercise the real draft controls while preserving video and USB."""
+    gui_click('Layout')
+    gui_click('Refresh monitor')
+    gui_ready('gui-layout-preview-ready')
+    before = read_state('status')
+    usb = read_state('kvm', 'status')
+    if before['mode'] == 'pip':
+        summary['layoutPreview'] = {'verdict': 'INCONCLUSIVE', 'reason': 'PIP has no editable layout mode in this UI.'}
+        return
+    current = gui_snapshot('gui-layout-preview-current', screenshot=True)
+    tree = current.get('tree_markdown', '')
+    assert 'AXStaticText = "Live"' in tree, 'An unedited readback is not labelled Live'
+    visible = [before['source1']] + ([before['source2']] if before['mode'] == 'pbp' else [])
+    assigned = [machine for machine in registry['machines'] if machine.get('input')]
+    assert all(machine['name'] in tree for machine in assigned), 'A configured video machine is missing from the preview'
+    bundle_id = plistlib.loads((args.app / 'Contents/Info.plist').read_bytes())['CFBundleIdentifier'] if args.app else 'com.danielsivan.msi-screen.menu'
+    sharing_preference = subprocess.run(['defaults', 'read', bundle_id, 'universalControlPeerID'],
+                                       capture_output=True, text=True)
+    if sharing_preference.returncode == 0:
+        peer_id = sharing_preference.stdout.strip()
+        peer = next((machine for machine in registry['machines']
+                     if machine['id'] == peer_id and machine['platform'] == 'macos' and machine['access'] != 'local'), None)
+        local = next((machine for machine in registry['machines']
+                      if machine['access'] == 'local' and machine['platform'] == 'macos'), None)
+        if peer and local:
+            assert 'Universal Control' in tree and local['name'] in tree and peer['name'] in tree, 'Configured Mac sharing link is missing'
+            assert peer['name'] + ', keyboard and mouse via Universal Control' in tree, 'Shared Mac still lacks its input-sharing label'
+            summary['universalControlLink'] = {'verdict': 'PASS', 'localMachine': local['id'], 'peerMachine': peer['id'],
+                                              'source': 'user-confirmed configuration', 'liveInputTransfer': 'not exercised'}
+    regions = ['LEFT', 'RIGHT'] if before['mode'] == 'pbp' else ['FULL SCREEN']
+    port_titles = {'hdmi1': 'HDMI 1', 'hdmi2': 'HDMI 2', 'dp': 'DisplayPort', 'usbc': 'USB-C'}
+    for index, (region, port) in enumerate(zip(regions, visible)):
+        content = tree.split('AXStaticText = "' + region + '"', 1)[1]
+        boundary = 'AXStaticText = "' + regions[index + 1] + '"' if index + 1 < len(regions) else 'AXStaticText = "Keyboard and mouse move together'
+        content = content.split(boundary, 1)[0]
+        machine = next((item for item in assigned if item['input'] == port), None)
+        assert port_titles[port] in content and (machine is None or machine['name'] in content), 'Preview pane does not match its actual input'
+    other = [machine for machine in assigned if machine['input'] not in visible]
+    if other:
+        assert 'OFF SCREEN' in tree, 'Other assigned video inputs are missing'
+    eligible = [machine for machine in registry['machines']
+                if (machine['access'] == 'local' and machine['platform'] == 'macos' and machine.get('input') == 'usbc')
+                or (machine['id'] == registry.get('usbUpstreamMachineID') and machine['platform'] == 'linux'
+                    and machine['access'] == 'ssh')]
+    for machine in eligible:
+        if machine.get('input'):
+            assert ('Enable keyboard and mouse on ' + machine['name'] in tree
+                    or 'Keyboard and mouse enabled on ' + machine['name'] in tree), 'A wired USB host has no preview control'
+    for machine in assigned:
+        if machine not in eligible:
+            assert 'Enable keyboard and mouse on ' + machine['name'] not in tree, 'An unwired computer gained a USB action'
+    expected_owner = next((machine for machine in eligible if machine['id'] == usb.get('machineID')), None)
+    if usb['route'] in ('usbc', 'upstream') and expected_owner and expected_owner.get('input'):
+        assert 'Keyboard and mouse enabled on ' + expected_owner['name'] in tree, 'Preview USB owner differs from the CLI readback'
+        for machine in eligible:
+            if machine != expected_owner:
+                assert 'Keyboard and mouse enabled on ' + machine['name'] not in tree, 'Preview claims two USB owners'
+    draft_label = 'Full screen' if before['mode'] == 'pbp' else 'Side by side'
+    gui_show_controls({draft_label}, 'gui-layout-preview-mode')
+    gui_click(draft_label)
+    gui_wait_for('gui-layout-preview-draft', lambda value: 'Draft · choose Apply layout' in value)
+    gui_snapshot('gui-layout-preview-draft', screenshot=True)
+    assert read_state('status') == before, 'Preview draft changed monitor video'
+    assert read_state('kvm', 'status') == usb, 'Preview draft changed USB ownership'
+    gui_click('Refresh monitor')
+    gui_ready('gui-layout-preview-refreshed')
+    refreshed = gui_snapshot('gui-layout-preview-refreshed', screenshot=True)
+    assert 'Draft · choose Apply layout' in refreshed.get('tree_markdown', ''), 'Refresh discarded the pending draft'
+    gui_show_controls({'Side by side' if before['mode'] == 'pbp' else 'Full screen'}, 'gui-layout-preview-restore-mode')
+    gui_click('Side by side' if before['mode'] == 'pbp' else 'Full screen')
+    reset = gui_snapshot('gui-layout-preview-reset', screenshot=True)
+    assert 'AXStaticText = "Live"' in reset.get('tree_markdown', ''), 'Restoring the draft controls did not restore the live preview'
+    assert read_state('status') == before and read_state('kvm', 'status') == usb
+    summary['layoutPreview'] = {'verdict': 'PASS', 'visibleInputs': visible,
+                                'otherAssignedMachines': [machine['id'] for machine in other],
+                                'wiredUSBHosts': [machine['id'] for machine in eligible],
+                                'draftPreservedVideoAndUSB': True, 'refreshPreservedDraft': True,
+                                'physicalInputDelivery': 'not exercised'}
+
+
 def gui_input(index, value):
     gui_click(role='AXPopUpButton', occurrence=index)
-    gui_click({'dp': 'DisplayPort', 'usbc': 'USB-C', 'hdmi1': 'HDMI 1', 'hdmi2': 'HDMI 2'}[value], 'AXMenuItem')
+    title = {'dp': 'DisplayPort', 'usbc': 'USB-C', 'hdmi1': 'HDMI 1', 'hdmi2': 'HDMI 2'}[value]
+    state = gui_snapshot('gui-input-options')
+    options = [e.get('label', '') for e in state.get('elements', []) if e.get('role') == 'AXMenuItem'
+               and (e.get('label') == title or e.get('label', '').endswith(' · ' + title))]
+    assert len(options) == 1, 'Input port option missing or ambiguous: ' + title
+    gui_click(options[0], 'AXMenuItem')
 
 
 def gui_apply(label):
@@ -915,8 +1702,31 @@ def gui_machines(label, registry):
     names = [machine['name'] for machine in registry['machines']]
     assert all(name in snapshot.get('tree_markdown', '') for name in names), 'A saved machine card is missing'
     assert snapshot.get('tree_markdown', '').count('AXStaticText = "Main & extended displays"') == \
-        sum(machine['platform'] == 'macos' for machine in registry['machines']), \
+        sum(machine['platform'] == 'macos' and machine['access'] != 'video-only' for machine in registry['machines']), \
         'Mac display roles must be visible without expanding connection details'
+    gui_show_controls(set(), label + '-tailnet-refresh', identifiers={'tailnet-refresh'})
+    gui_click(identifier='tailnet-refresh')
+    discovered = run('machine', 'discover', success=None)
+    if discovered.get('outcome') == 'complete':
+        peers = discovered['peers']
+        # SwiftUI flattens non-actionable row containers in the AX tree. Prove
+        # every advertised name and each supported peer's stable action instead.
+        peer_names = {'AXStaticText = ' + json.dumps(peer['name'], ensure_ascii=False) for peer in peers}
+        configure_ids = {'id=tailnet-configure-' + peer['id'] for peer in peers
+                         if not peer['isSelf'] and peer['operatingSystem'] in ('macos', 'linux')
+                         and (peer.get('dnsName') or peer.get('addresses'))}
+        snapshot = gui_wait_for(label + '-tailnet', lambda tree:
+                               all(name in tree for name in peer_names)
+                               and all(identifier in tree for identifier in configure_ids))
+        assert run('machine', 'list') == registry, 'Discovery changed saved machine assignments'
+        summary['tailnetDiscovery'] = {'verdict': 'PASS', 'peerCount': len(peers),
+                                      'includesOffline': any(peer.get('advertisedOnline') is False
+                                                             for peer in discovered['peers']),
+                                      'configuredInputsChanged': False}
+    else:
+        summary['tailnetDiscovery'] = {'verdict': 'INCONCLUSIVE',
+                                      'discoveryOutcome': discovered.get('outcome'),
+                                      'issues': discovered.get('issues', [])}
     return snapshot
 
 
@@ -1014,6 +1824,28 @@ def gui_named_menu(label):
     print(json.dumps(event), flush=True)
     if result.get('effect') == 'refused':
         raise RuntimeError(result)
+
+
+def gui_wait_for_quit_readiness():
+    # App actions stays enabled during reads, while Quit and footer Refresh
+    # share the allBusy gate. Opening the menu early can leave a disabled Quit
+    # that never becomes actionable as the underlying SwiftUI view refreshes.
+    expected = (gui_pid, gui_window, owner)
+    deadline = time.monotonic() + 55
+    while True:
+        assert gui_owned and gui_window is not None and owns_gui_process() \
+            and (gui_pid, gui_window, owner) == expected, 'Cannot prepare Quit in an unowned process'
+        state = gui_snapshot('gui-quit-readiness')
+        assert (state.get('pid'), state.get('window_id')) == expected[:2], 'Quit readiness observed a different window'
+        controls = [element for element in state.get('elements', [])
+                    if element.get('role') == 'AXButton' and element.get('enabled', True)
+                    and element.get('label') in ('Refresh monitor', 'Refresh peripheral controls', 'Refresh app settings')]
+        assert len(controls) <= 1, 'Quit readiness footer is ambiguous'
+        if controls:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError('Owned GUI did not become idle before Quit; no termination action sent')
+        time.sleep(0.2)
 
 
 def gui_close_controls():
@@ -1144,6 +1976,11 @@ def predict_machine_route(machine, route, baseline):
 def verify_machine_dry_runs(registry, baseline):
     for machine in registry['machines']:
         for route in ('fullscreen', 'pbp-left', 'pbp-right'):
+            if machine.get('input') is None:
+                failure = run('machine', route, machine['id'], '--dry-run', success=False)
+                assert failure['verified'] is False and failure.get('before') is None
+                assert read_state('status') == baseline, 'Unassigned machine route changed the monitor'
+                continue
             try:
                 expected = predict_machine_route(machine, route, baseline)
             except ValueError:
@@ -1161,9 +1998,9 @@ def verify_machine_dry_runs(registry, baseline):
 
 def gui_wait_layout_readback(state, label):
     input_titles = {'hdmi1': 'HDMI 1', 'hdmi2': 'HDMI 2', 'dp': 'DisplayPort', 'usbc': 'USB-C'}
-    selected = (f"Selected layout: {input_titles[state['source1']]} left, "
+    selected = (f"Current layout: {input_titles[state['source1']]} left, "
                 f"{input_titles[state['source2']]} right") if state['mode'] == 'pbp' \
-        else f"Selected layout: {input_titles[state['source1']]} full screen"
+        else f"Current layout: {input_titles[state['source1']]} full screen"
     return gui_wait_for(label, lambda tree: selected in tree and 'Read back from monitor' in tree,
                         failed=('Refresh before trying again.',), timeout=15)
 
@@ -1363,6 +2200,14 @@ print(json.dumps({'devices': devices, 'companionExitCode': r.returncode,
                '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=8',
                '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2', '-o', 'LogLevel=ERROR',
                '--', host, 'python3 -c ' + shlex.quote(script)]
+    if machine.get('sshTransport') == 'tailscale':
+        candidates = ['/Applications/Tailscale.app/Contents/MacOS/Tailscale',
+                      '/opt/homebrew/bin/tailscale', '/usr/local/bin/tailscale']
+        executable = next((path for path in candidates if os.access(path, os.X_OK)), None)
+        assert executable, 'Native Tailscale SSH client is unavailable'
+        command = [executable, 'ssh', host, '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
+                   '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2', '-o', 'LogLevel=ERROR',
+                   'python3 -c ' + shlex.quote(script)]
     result = subprocess.run(command, capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise RuntimeError('Linux USB status failed: ' + result.stderr[-2048:])
@@ -1384,26 +2229,42 @@ def usb_count(observed, identifier):
 def validate_kvm_status(state, registry, machine):
     assert state['schemaVersion'] == 1 and state['model'] == 'MD342CQP' and state['protocolVersion'] == 'V20'
     assert state['route'] in ('usbc', 'upstream', 'auto')
-    local = [m for m in registry['machines'] if m['platform'] == 'macos' and m.get('host') is None]
-    assert len(local) == 1 and local[0]['input'] == 'usbc', 'This Mac must be assigned to USB-C'
+    local = [m for m in registry['machines'] if m['platform'] == 'macos' and m.get('access') == 'local']
+    assert len(local) == 1 and local[0].get('input') == 'usbc', 'This Mac must be assigned to USB-C'
     expected_id = local[0]['id'] if state['controlHost'] == 'local' else machine['id']
     assert state['controlHost'] in ('local', 'upstream') and state.get('machineID') == expected_id
     return state
 
 
-def gui_show_controls(labels, prefix, bottom_margin=24):
+def gui_show_controls(labels, prefix, bottom_margin=24, identifiers=None, identifier_role='AXButton'):
     """Ground background wheel scrolling on fresh window and control frames."""
     previous_frames = None
     unchanged_scrolls = 0
+    ready_deadline = time.monotonic() + 55
     for attempt in range(10):
-        state = gui_snapshot(prefix + '-visible-' + str(attempt), screenshot=True)
+        while True:
+            state = gui_snapshot(prefix + '-visible-' + str(attempt), screenshot=True)
+            # A tab change starts asynchronous reads. Cua omits the disabled
+            # footer from actionable elements until those reads finish.
+            footers = [e['frame'] for e in state.get('elements', [])
+                       if e.get('label') in ('Refresh monitor', 'Refresh peripheral controls') and e.get('frame')]
+            if footers:
+                break
+            if time.monotonic() >= ready_deadline:
+                raise RuntimeError('Controls did not finish their read before scrolling')
+            time.sleep(0.2)
         elements = state.get('elements', [])
-        controls = [e for e in elements if e.get('label') in labels and e.get('frame')]
-        assert len(controls) == len(labels) and {e['label'] for e in controls} == labels, 'Controls are missing or ambiguous'
+        if identifiers:
+            matches = [gui_identifier_elements(state, identifier, role=identifier_role) for identifier in sorted(identifiers)]
+            assert all(len(found) == 1 and found[0].get('frame') for found in matches), 'Controls are missing or ambiguous'
+            controls = [found[0] for found in matches]
+        else:
+            controls = [e for e in elements if e.get('label') in labels and e.get('frame')]
+            assert len(controls) == len(labels) and {e['label'] for e in controls} == labels, 'Controls are missing or ambiguous'
         tabs = [e['frame'] for e in elements if e.get('label') in ('Layout', 'Monitor', 'Machines', 'Peripherals')
                 and e.get('role') in ('AXButton', 'AXRadioButton') and e.get('frame')]
-        footer = next(e['frame'] for e in elements
-                      if e.get('label') in ('Refresh monitor', 'Refresh peripheral controls') and e.get('frame'))
+        assert len(footers) == 1, 'Controls footer is ambiguous'
+        footer = footers[0]
         bounds = state['window_bounds']
         assert tabs and bounds['width'] > 0
         top = max(f['y'] + f['h'] for f in tabs) + 12
@@ -1461,12 +2322,13 @@ def exercise_kvm_roundtrip(machine_id):
     global kvm_local_safe
     registry = run('machine', 'list')
     matches = [m for m in registry['machines'] if m['id'] == machine_id]
-    assert len(matches) == 1 and matches[0]['platform'] == 'linux' and matches[0].get('host'), \
+    assert len(matches) == 1 and matches[0]['platform'] == 'linux' and matches[0].get('access') == 'ssh' and matches[0].get('host'), \
         'KVM exercise requires one saved Linux machine with an SSH host'
     machine = matches[0]
     if args.gui:
-        assert [m['id'] for m in registry['machines'] if m['platform'] == 'linux'] == [machine_id], \
-            'GUI KVM exercise requires exactly one configured Linux USB-B machine'
+        candidates = [m['id'] for m in registry['machines'] if m['platform'] == 'linux' and m.get('access') == 'ssh' and m.get('host')]
+        selected = registry.get('usbUpstreamMachineID')
+        assert selected == machine_id, 'GUI KVM exercise must match the configured USB-B machine'
     def status():
         return validate_kvm_status(read_state('kvm', 'status', '--machine', machine_id, timeout=60), registry, machine)
     original = status()
@@ -1708,15 +2570,81 @@ def inspect_peripheral_details(snapshot, usb, options, probe):
     return proof
 
 
+def gui_inspect_detected_peripherals(label):
+    """Read passive inventory, select one rendered endpoint, and inspect its support affordance."""
+    original = gui_snapshot(label + '-tab')
+    original_tab = next(name for name in ('Machines', 'Peripherals')
+                        if 'AXButton = "Selected" (' + name + ')' in original.get('tree_markdown', ''))
+    refresh = 'peripherals-refresh-devices'
+    gui_show_controls(set(), label + '-refresh', identifiers={refresh})
+    gui_click(identifier=refresh)
+    state = gui_wait_for(label + '-read', lambda tree:
+        'Detected on this Mac' in tree and 'Checking connected devices…' not in tree)
+    inventory = run('devices', 'list')
+    assert inventory['schema'] == 1
+    endpoints = {endpoint['id']: endpoint for record in inventory['devices'] for endpoint in record['endpoints']}
+    tree = state.get('tree_markdown', '')
+    selected_ids = re.findall(r'\bid=peripheral-select-([0-9a-f]{64})(?=\s|\])', tree)
+    domain_ids = re.findall(r'\bid=detected-peripheral-([0-9a-f]{64})(?=\s|\])', tree)
+    assert len(selected_ids) == len(set(selected_ids)), 'A detected endpoint is displayed more than once'
+    assert len(domain_ids) == len(set(domain_ids)), 'A physical peripheral is displayed more than once'
+    assert set(selected_ids) <= endpoints.keys(), 'GUI peripheral is absent from fresh passive inventory'
+    assert set(domain_ids) <= {endpoint['physicalDomainID'] for endpoint in endpoints.values()}, \
+        'GUI physical peripheral is absent from fresh passive inventory'
+    proof = {'displayedEndpointIDs': selected_ids, 'displayedPhysicalDomainIDs': domain_ids,
+             'supportRequest': 'not invoked', 'automaticAttachmentNotifications': 'not exercised',
+             'physicalGrouping': 'PASS' if domain_ids else 'INCONCLUSIVE: Cua did not expose physical group identifiers'}
+    if selected_ids:
+        endpoint_id = selected_ids[0]
+        inspections = {}
+        # The resolver owns reserved-domain classification. Inspect is passive
+        # metadata only; prefer an unconfigured HID device for the support path.
+        for candidate in sorted(selected_ids, key=lambda value: endpoints[value]['kind'] != 'hid'):
+            inspection = run('devices', 'inspect', candidate)
+            assert inspection['schema'] == 1 and inspection['deviceID'] == candidate
+            inspections[candidate] = inspection['support']
+            if inspection['support'] == 'unconfigured':
+                endpoint_id = candidate
+                break
+        selector = 'peripheral-select-' + endpoint_id
+        gui_show_controls(set(), label + '-select', identifiers={selector})
+        gui_click(identifier=selector)
+        support = 'device-write-support-' + endpoint_id
+        gui_wait_for(label + '-selected', lambda tree: bool(re.search(r'\bid=' + re.escape(support) + r'(?=\s|\])', tree)))
+        selected = gui_show_controls(set(), label + '-support', identifiers={support})
+        actions = gui_identifier_elements(selected, support)
+        assert len(actions) == 1 and actions[0]['role'] == 'AXButton' and actions[0].get('enabled', True), \
+            'Selected peripheral has no available support action'
+        proof.update(selectedEndpointID=endpoint_id, selectedSupportClassification=inspections[endpoint_id],
+                     supportActionPresent=True)
+        # Selecting an unknown USB endpoint must not replace the monitor's
+        # Layout surface, which remains available while its support is edited.
+        gui_click('Layout')
+        gui_wait_for(label + '-monitor-preserved', lambda tree: 'LAYOUT PREVIEW' in tree and 'MSI monitor' in tree)
+        proof['monitorControlsPreserved'] = True
+        gui_click(original_tab)
+        gui_wait_for(label + '-returned', lambda tree: 'AXButton = "Selected" (' + original_tab + ')' in tree
+                     and 'Detected on this Mac' in tree)
+    else:
+        assert 'No external peripherals detected on this Mac.' in tree, 'Detected peripheral list exposed no endpoint controls'
+        proof.update(supportActionPresent=False, verdict='INCONCLUSIVE: no detected peripheral to select')
+    gui_snapshot(label + '-verified', screenshot=True)
+    return inventory, proof
+
+
 def gui_peripheral_sections(tree):
-    # Cua flattens SwiftUI groups and omits static-row identifiers. The actual
-    # device headers provide unambiguous scopes for otherwise repeated labels.
-    mouse = 'AXStaticText = "MT760 Pro"'
-    keyboard = 'AXStaticText = "POP Keys"'
-    assert tree.count(mouse) == tree.count(keyboard) == 1, 'Peripheral headers are missing or ambiguous'
-    assert tree.index(mouse) < tree.index(keyboard), 'Peripheral section order changed'
-    return {'rapoo': tree.split(mouse, 1)[1].split(keyboard, 1)[0],
-            'bolt': tree.split(keyboard, 1)[1]}
+    # Device names also occur in passive inventory. Provider disclosure IDs
+    # delimit their controls without assuming a configured mouse/keyboard.
+    markers = []
+    for kind, identifier in [('rapoo', 'rapoo-controls'), ('bolt', 'pop-controls')]:
+        matches = list(re.finditer(r'^\s*- \[\d+\] AXDisclosureTriangle\b[^\n]*\bid='
+                                  + identifier + r'(?=\s|\])[^\n]*$', tree, re.MULTILINE))
+        assert len(matches) <= 1, 'Ambiguous peripheral provider: ' + identifier
+        if matches:
+            markers.append((matches[0].start(), kind))
+    markers.sort()
+    return {kind: tree[start:markers[index + 1][0] if index + 1 < len(markers) else len(tree)]
+            for index, (start, kind) in enumerate(markers)}
 
 
 def gui_peripheral_texts(section):
@@ -1727,9 +2655,10 @@ def gui_peripheral_texts(section):
 def gui_usb_host_selector(state, usb, registry):
     """Check both destinations without clicking a host or inferring physical input."""
     tree = state.get('tree_markdown', '')
-    local = [m for m in registry['machines'] if m.get('host') is None
-             and m['platform'] == 'macos' and m['input'] == 'usbc']
-    linux = [m for m in registry['machines'] if m['platform'] == 'linux']
+    local = [m for m in registry['machines'] if m.get('access') == 'local'
+             and m['platform'] == 'macos' and m.get('input') == 'usbc']
+    linux = [m for m in registry['machines'] if m['platform'] == 'linux' and m.get('access') == 'ssh' and m.get('host')]
+    linux = [m for m in linux if m['id'] == registry.get('usbUpstreamMachineID')]
     configured = len(local) == len(linux) == 1
     labels = {'usbc': 'USB-C Mac', 'upstream': 'USB-B ' + (linux[0]['name'] if len(linux) == 1 else 'Linux')}
     titles = {'usbc': 'USB-C', 'upstream': 'USB-B upstream', 'auto': 'Auto (follow video)'}
@@ -1775,20 +2704,45 @@ def gui_read_usb_selector(label, usb, registry):
 
 def gui_inspect_peripheral_details(snapshot, usb, proof, probe, controller_probe=False):
     gui_click('Peripherals', 'AXButton')
-    state = gui_wait_for('gui-peripheral-screen', lambda tree:
+    gui_wait_for('gui-peripheral-screen', lambda tree:
                          'AXButton = "Selected" (Peripherals)' in tree and 'Your peripherals' in tree
-                         and 'AXStaticText = "MT760 Pro"' in tree and 'AXStaticText = "POP Keys"' in tree
-                         and 'Checked on ' in tree and 'Checking…' not in tree
-                         and ('Declared HID controls' in tree or usb['controlHost'] != 'local'), timeout=55)
+                         and 'Checked on ' in tree and 'Checking…' not in tree, timeout=55)
+    inventory, detected = gui_inspect_detected_peripherals('gui-peripheral-detected')
     state, host_selector = gui_read_usb_selector('gui-peripherals-host', usb, run('machine', 'list'))
     sections = gui_peripheral_sections(state.get('tree_markdown', ''))
+    identities = [endpoint['identity'] for record in inventory['devices'] for endpoint in record['endpoints']]
+    expected_sections = set()
     for receiver in snapshot['receivers']:
+        vendor, product = {'rapoo': (0x24ae, 0x186a), 'bolt': (0x046d, 0xc548)}[receiver['id']]
+        present = receiver['connection'] != 'notDetected' and (usb['controlHost'] != 'local'
+            or any(identity.get('vendorID') == vendor and identity.get('productID') == product for identity in identities))
+        if receiver['id'] == 'bolt':
+            present = present and any(device['kind'] == 'keyboard' and device.get('name') in ('POP Keys', 'Logi POP Keys')
+                                      for device in receiver['pairedDevices'])
+        if present:
+            expected_sections.add(receiver['id'])
+    assert set(sections) == expected_sections, 'Rendered peripheral providers differ from detected receivers and pairings'
+    for kind in sorted(expected_sections):
+        identifier = 'rapoo-controls' if kind == 'rapoo' else 'pop-controls'
+        state = gui_show_controls(set(), 'gui-' + kind + '-provider', identifiers={identifier},
+                                  identifier_role='AXDisclosureTriangle')
+        controls = gui_identifier_elements(state, identifier, role='AXDisclosureTriangle')
+        assert len(controls) == 1
+        gui_expand(controls[0]['label'])
+    if 'rapoo' in expected_sections and usb['controlHost'] == 'local':
+        state = gui_wait_for('gui-pointer-descriptor', lambda tree: 'Declared HID controls' in tree, timeout=55)
+    else:
+        state = gui_snapshot('gui-peripheral-providers')
+    sections = gui_peripheral_sections(state.get('tree_markdown', ''))
+    for receiver in snapshot['receivers']:
+        if receiver['id'] not in sections:
+            continue
         rows = [text for text in gui_peripheral_texts(sections[receiver['id']]) if text.startswith('Receiver, ')]
         expected = {'monitorHub': 'Monitor hub', 'elsewhere': 'Detected outside monitor hub',
                     'notDetected': 'Not detected'}[receiver['connection']]
         assert len(rows) == 1 and rows[0].startswith('Receiver, ' + expected), 'Peripheral detail connection differs from CLI'
     descriptor = proof.get('pointerDescriptor')
-    if descriptor is not None:
+    if descriptor is not None and 'rapoo' in sections:
         texts = gui_peripheral_texts(sections['rapoo'])
         assert 'Declared HID controls' in texts
         for kind, title in [('horizontalWheel', 'Side wheel'), ('verticalWheel', 'Main wheel')]:
@@ -1796,14 +2750,15 @@ def gui_inspect_peripheral_details(snapshot, usb, proof, probe, controller_probe
             assert (title if present else title + ' not declared') in texts, 'Displayed HID capability differs from descriptor'
         assert str(sum(u['kind'] == 'button' for u in descriptor['usages'])) + ' buttons' in texts
     gui_proof = {'screenPresent': True, 'inputEvents': 'not exercised',
-                 'usbHostSelector': host_selector}
+                 'usbHostSelector': host_selector, 'detectedDevices': detected,
+                 'renderedProviders': sorted(expected_sections)}
+    controllers = run('peripherals', 'controllers')
     gui_show_controls({'Refresh game controllers'}, 'gui-game-controllers')
     gui_click('Refresh game controllers', 'AXButton')
     controller_state = gui_wait_for('gui-game-controllers-read', lambda tree:
         'Game controllers' in tree and 'This Mac · Bluetooth & USB' in tree
         and ('No controller detected on this Mac.' in tree or 'Recognized by macOS' in tree
              or 'game mode unsupported' in tree))
-    controllers = run('peripherals', 'controllers')
     assert all(device['name'] in controller_state['tree_markdown'] for device in controllers['devices'])
     gui_snapshot('gui-game-controllers-result', screenshot=True)
     gui_proof['localControllers'] = controllers
@@ -1836,9 +2791,14 @@ def gui_inspect_peripheral_details(snapshot, usb, proof, probe, controller_probe
     def read_detail(kind, label, disclosure, prefix, end_marker):
         def region(state):
             section = gui_peripheral_sections(state.get('tree_markdown', ''))[kind]
-            start = 'AXButton (' + label + ')'
-            assert section.count(start) == 1 and end_marker in section, 'Peripheral action scope changed: ' + label
-            return section.split(start, 1)[1].split(end_marker, 1)[0]
+            # SwiftUI replaces the read button with an AXBusyIndicator while
+            # its ProgressView is visible. Both retain the same action label.
+            starts = list(re.finditer(r'^[ \t]*- (?:\[\d+\] )?AX(?:Button|BusyIndicator) \('
+                                      + re.escape(label) + r'\)', section, re.MULTILINE))
+            assert len(starts) == 1, 'Peripheral action scope changed: ' + label
+            result = section[starts[0].end():]
+            assert end_marker in result, 'Peripheral result boundary changed: ' + label
+            return result.split(end_marker, 1)[0]
         before = gui_snapshot(prefix + '-before', screenshot=True)
         previous = region(before)
         if not enabled(before, label):
@@ -1874,9 +2834,11 @@ def gui_inspect_peripheral_details(snapshot, usb, proof, probe, controller_probe
         return {'resultPresent': has_details, 'errorPresent': not has_details,
                 'busyObserved': saw_busy, 'displayedText': texts}, state
 
-    gui_show_controls({'Features & device controls'}, 'gui-peripheral-mouse')
-    mouse = read_detail('rapoo', 'Read mouse details', 'Firmware details', 'gui-rapoo',
-                        'AXStaticText = "Side wheel on this Mac"')
+    mouse = None
+    if 'rapoo' in sections:
+        gui_show_controls({'Features & device controls'}, 'gui-peripheral-mouse')
+        mouse = read_detail('rapoo', 'Read mouse details', 'Firmware details', 'gui-rapoo',
+                            'AXStaticText = "Side wheel on this Mac"')
     if mouse is None:
         gui_proof['mouseDetailsSkipped'] = 'Read mouse details requires the monitor-hub receiver on this Mac.'
     else:
@@ -1894,7 +2856,7 @@ def gui_inspect_peripheral_details(snapshot, usb, proof, probe, controller_probe
                 gui_show_controls({'Onboard side wheel'}, 'gui-rapoo-sidewheel', bottom_margin=120)
                 gui_snapshot('gui-rapoo-sidewheel-result', screenshot=True)
                 gui_expand('Onboard side wheel', expanded=False)
-    if probe:
+    if probe and 'rapoo' in sections:
         def test_texts(state):
             section = gui_peripheral_sections(state.get('tree_markdown', ''))['rapoo']
             return gui_peripheral_texts(section.split('AXStaticText = "Wheels & buttons"', 1)[1]
@@ -1931,9 +2893,13 @@ def gui_inspect_peripheral_details(snapshot, usb, proof, probe, controller_probe
             gui_proof['inputEvents'] = 'bounded aggregate capture; physical controls not exercised by verifier'
         else:
             gui_proof['pointerProbeSkipped'] = 'Mouse test unavailable in this app: inspect captured host/access/descriptor diagnostics.'
-    gui_show_controls({'Setup & keyboard features'}, 'gui-peripheral-keyboard')
-    keyboard = read_detail('bolt', 'Read keyboard details', 'Reported mappings & firmware', 'gui-pop',
-                           'AXDisclosureTriangle (Setup & keyboard features)')
+    elif probe:
+        gui_proof['pointerProbeSkipped'] = 'No detected Rapoo receiver controls.'
+    keyboard = None
+    if 'bolt' in sections:
+        gui_show_controls({'Setup & keyboard features'}, 'gui-peripheral-keyboard')
+        keyboard = read_detail('bolt', 'Read keyboard details', 'Reported mappings & firmware', 'gui-pop',
+                               'AXDisclosureTriangle (Setup & keyboard features)')
     if keyboard is None:
         gui_proof['keyboardDetailsSkipped'] = 'Read keyboard details is unavailable; receiver pairing metadata is required.'
     else:
@@ -1967,6 +2933,7 @@ def inspect_peripherals(machine_id=None, label='peripherals', gui=False, details
             summary['controllerProbeSkipped'] = 'No native game controller connected to this Mac.'
     if gui:
         registry = run('machine', 'list')
+        gui_inspect_layout_preview(registry)
         gui_machines('gui-' + label + '-machines', registry)
         gui_show_controls({'Refresh USB route'}, 'gui-' + label, bottom_margin=150)
         gui_click('Refresh USB route', 'AXButton')
@@ -1985,11 +2952,14 @@ def inspect_peripherals(machine_id=None, label='peripherals', gui=False, details
         # Compare connection facts, not inherently time-sensitive radio replies.
         for receiver in snapshot['receivers']:
             marker = 'receiver-' + receiver['id'] + '-status'
-            prefix = 'Keyboard receiver: ' if receiver['id'] == 'bolt' else 'Mouse receiver: '
+            prefix = {'bolt': 'Logitech Bolt: ', 'rapoo': 'Rapoo NearLink: '}[receiver['id']]
             # SwiftUI combined rows can export AXUnknown with the full label
             # but omit their identifier. This is the observed Cua representation.
             rows = [line for line in tree.splitlines() if 'id=' + marker in line
                     or re.search(r'\bAXUnknown \(' + re.escape(prefix), line)]
+            if receiver['connection'] == 'notDetected':
+                assert not rows, 'An absent receiver still has a placeholder row: ' + marker
+                continue
             assert len(rows) == 1, 'Receiver status is missing or ambiguous: ' + marker
             expected = {'notDetected': 'Receiver not detected', 'elsewhere': 'Outside monitor hub',
                         'monitorHub': 'Detected ·' if receiver['id'] == 'bolt' else 'Receiver detected'}[receiver['connection']]
@@ -2000,6 +2970,8 @@ def inspect_peripherals(machine_id=None, label='peripherals', gui=False, details
             assert prefix + expected in rows[0], 'GUI receiver connection differs from the CLI snapshot'
         gui_snapshot('gui-' + label + '-verified', screenshot=True)
         summary['peripheralGUI'] = {'rowsPresent': True, 'inputEvents': 'not exercised'}
+        _, detected = gui_inspect_detected_peripherals('gui-' + label + '-machines-detected')
+        summary['peripheralGUI']['detectedDevices'] = detected
         if details:
             summary['peripheralDetailGUI'] = gui_inspect_peripheral_details(
                 snapshot, before, detail_proof, probe, controller_probe)
@@ -2052,8 +3024,8 @@ def gui_focus_machine(machine, before_action=None, use_layout=False):
 def exercise_machine_focus(machine_id):
     global kvm_local_safe
     registry = run('machine', 'list')
-    linux = [m for m in registry['machines'] if m['id'] == machine_id and m['platform'] == 'linux' and m.get('host')]
-    local = [m for m in registry['machines'] if m['platform'] == 'macos' and m.get('host') is None and m['input'] == 'usbc']
+    linux = [m for m in registry['machines'] if m['id'] == machine_id and m['platform'] == 'linux' and m.get('access') == 'ssh' and m.get('host') and m.get('input')]
+    local = [m for m in registry['machines'] if m['platform'] == 'macos' and m.get('access') == 'local' and m.get('input') == 'usbc']
     assert len(linux) == len(local) == 1, 'Focus exercise requires a saved Linux machine and this Mac assigned to USB-C'
     machine, mac = linux[0], local[0]
     def observe():
@@ -2390,7 +3362,7 @@ def exercise_arrangement():
     try:
         if args.gui:
             registry = run('machine', 'list')
-            machine = next(m for m in registry['machines'] if m['platform'] == 'macos' and m.get('host') is None)
+            machine = next(m for m in registry['machines'] if m['platform'] == 'macos' and m.get('access') == 'local')
             gui_machines('gui-arrangement-before', registry)
             label = 'Place ' + machine['name'] + ' MacBook ' + target + ' of MSI'
             gui_show_controls({label}, 'gui-arrangement-target', bottom_margin=50)
@@ -2433,7 +3405,7 @@ def exercise_main_role():
     try:
         if args.gui:
             registry = run('machine', 'list')
-            matches = [m for m in registry['machines'] if m['platform'] == 'macos' and m.get('host') is None]
+            matches = [m for m in registry['machines'] if m['platform'] == 'macos' and m.get('access') == 'local']
             assert len(matches) == 1, 'This Mac must be saved once in Machines'
             gui_machines('gui-before-main', registry)
             assert run('machine', 'list') == registry, 'Saved local machine changed before GUI action'
@@ -2538,7 +3510,7 @@ try:
         assert isinstance(local_baseline['computerName'], str) and isinstance(local_baseline['displays'], list)
         summary['localDisplaysBaseline'] = local_baseline
         registry_baseline = run('machine', 'list')
-        assert registry_baseline['schemaVersion'] == 1
+        assert registry_baseline['schemaVersion'] == 3
         summary['machines'] = registry_baseline
         verify_machine_dry_runs(registry_baseline, baseline)
         if args.peer_host:
@@ -2548,7 +3520,8 @@ try:
         with lock_path.open('r+') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             busy = run('status', success=False)
-            assert 'Another msi-screen process' in busy.get('error', '')
+            assert busy.get('error') == 'busy' and busy.get('verified') is False, \
+                'A held controller lock must return the structured busy refusal'
         assert read_state('status') == baseline, 'Lock test changed monitor state'
         # A valid full-screen baseline may store identical primary/secondary inputs.
         # Use the known DP + USB-C pair for the exercise, then restore that baseline.
@@ -2578,6 +3551,8 @@ try:
         gui_owned = owns_gui_process()
         if not gui_owned:
             raise RuntimeError('Launch reused an existing app; refusing to drive or quit it')
+        executable = subprocess.check_output(['ps', '-p', str(gui_pid), '-o', 'comm='], text=True).strip()
+        summary['guiExecutable'] = executable
         windows = launched.get('windows', [])
         if not windows:
             windows = cua.call('list_windows', pid=gui_pid)['windows']
@@ -2590,6 +3565,10 @@ try:
             assert receipt['pid'] == gui_pid and receipt['owner'] == owner, 'Window receipt is not ours'
             gui_window = receipt['windowID']
             assert isinstance(gui_window, int) and gui_window > 0, 'Invalid panel window ID'
+        if args.app:
+            expected_executable = args.app.resolve() / 'Contents/MacOS/MSIScreenMenu'
+            assert Path(executable).resolve() == expected_executable.resolve(), \
+                'Launch reached a different app bundle: ' + executable
         if args.peripherals or args.permissions or args.menu_appearance or args.update_fixture or args.login_item or args.agent_skill_fixture:
             gui_wait_for('gui-health', lambda tree: 'Machines' in tree)
         else:
@@ -2767,6 +3746,7 @@ finally:
                 # exiting. Dismiss only our recognized machine editor first.
                 gui_dismiss_machine_editor('gui-quit-editor-cleanup')
                 try:
+                    gui_wait_for_quit_readiness()
                     gui_named_menu('App actions')
                     gui_click('Quit', 'AXMenuItem')
                 except Exception:

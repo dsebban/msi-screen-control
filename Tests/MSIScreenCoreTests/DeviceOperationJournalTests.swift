@@ -96,9 +96,13 @@ final class OwnedDeviceControlFixture {
         defer { SupportPackageInstaller.cleanupOwned(parent, parent: try! SupportDirectory.root(root, create: false), name: parent.url.lastPathComponent) }
         let package = try parent.directory("package", create: true), scratch = try parent.directory("scratch", create: true)
         try content.copy(to: package); try SupportPackageInstaller.validateNative(content, directory: package)
-        let request = AdapterRequest(providerDigest: content.digest, payload: payload, timeout: 5)
+        // These correctness fixtures honor each operation's protocol cap and
+        // leave read/apply headroom for cold native CI process startup. The
+        // timeout-specific tests exercise their own short deadlines separately.
+        let timeout: TimeInterval = payload.operation == .read ? 10 : payload.operation == .apply ? 15 : 5
+        let request = AdapterRequest(providerDigest: content.digest, payload: payload, timeout: timeout)
         let executable = package.url.appendingPathComponent("adapter")
-        var spec = ProcessRunner.Specification(executable: executable, timeout: 6, input: try StrictJSON.canonical(request), scratchParent: scratch.url)
+        var spec = ProcessRunner.Specification(executable: executable, timeout: timeout + 1, input: try StrictJSON.canonical(request), scratchParent: scratch.url)
         spec.inheritedDescriptors = lease.descriptors.enumerated().map { .init(source: $0.element, destination: 210 + Int32($0.offset)) }
         let output = try await AdapterProcessHost.runSupervised(specification: spec, request: request,
             expectedExecutableDigest: SupportPackageContent.hash(content.files["adapter"]!), live: AdapterLiveness())

@@ -2,6 +2,7 @@ import Foundation
 
 public enum RemoteMacError: LocalizedError {
     case invalidHost
+    case tailscaleUnavailable
     case helperMissing
     case timedOut
     case failed(String)
@@ -10,7 +11,9 @@ public enum RemoteMacError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .invalidHost:
-            return "Choose an SSH alias containing only letters, digits, dots, underscores or hyphens."
+            return "Choose [user@]host using only letters, digits, dots, colons, underscores or hyphens."
+        case .tailscaleUnavailable:
+            return "The Tailscale command is unavailable. Install or open Tailscale, then try again."
         case .helperMissing:
             return "The MSI Screen companion is missing on the other Mac. Install the companion before changing its display roles."
         case .timedOut:
@@ -28,9 +31,11 @@ public enum RemoteMacError: LocalizedError {
 /// with the typed display request carried through stdin.
 public struct RemoteMacClient {
     public let host: String
+    public let transport: SSHTransport
 
-    public init(host: String) {
+    public init(host: String, transport: SSHTransport = .standard) {
         self.host = host
+        self.transport = transport
     }
 
     public func state() async throws -> MacDisplayState {
@@ -48,36 +53,23 @@ public struct RemoteMacClient {
     private func send(_ request: MacDisplayRequest) async throws -> MacDisplayState {
         try validateHost()
         let output = try await ProcessRunner.run(
-            executable: URL(fileURLWithPath: "/usr/bin/ssh"),
-            arguments: Self.arguments(host: host),
+            executable: try transport.executable(),
+            arguments: try Self.arguments(host: host, transport: transport),
             timeout: 45, input: JSONEncoder().encode(request)
         )
         return try Self.decode(output)
     }
 
     func validateHost() throws {
-        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
-        guard !host.isEmpty, host.utf8.count <= 128,
-              host.first != "-", host.unicodeScalars.allSatisfy(allowed.contains) else {
-            throw RemoteMacError.invalidHost
-        }
+        try SSHTransport.validate(host: host)
     }
 
-    static func arguments(host: String) -> [String] {
-        [
-            "-T",
-            "-o", "BatchMode=yes",
-            "-o", "IdentitiesOnly=yes",
-            "-o", "StrictHostKeyChecking=yes",
-            "-o", "ConnectTimeout=8",
-            "-o", "ServerAliveInterval=5",
-            "-o", "ServerAliveCountMax=2",
-            "-o", "LogLevel=ERROR",
-            "--", host,
+    static func arguments(host: String, transport: SSHTransport = .standard) throws -> [String] {
+        try transport.arguments(host: host, command:
             // This text is constant. Only the remote shell expands its own
             // HOME, inside double quotes, so paths containing spaces are safe.
             #"if [ ! -x "$HOME/.local/share/msi-screen-control/msi-screen" ]; then printf '%s\n' MSI_SCREEN_HELPER_MISSING >&2; exit 127; fi; exec "$HOME/.local/share/msi-screen-control/msi-screen" display-request"#
-        ]
+        )
     }
 
     static func decode(_ output: ProcessRunner.Output) throws -> MacDisplayState {

@@ -62,10 +62,13 @@ public struct MachineFocusCoordinator {
                       dryRun: Bool = false) async throws -> MachineFocusResult {
         try registry.validate()
         let machine = try registry.machine(id: machineID)
+        guard let input = machine.input else {
+            throw ScreenError.message("Assign a monitor input to \(machine.name) before focusing it")
+        }
         let targetUSB: KVMRoute
         if machine.isLocal, machine.platform == .macos, machine.input == .usbc {
             targetUSB = .usbc
-        } else if machine.platform == .linux, machine.id == kvm.upstreamMachine?.id {
+        } else if machine.isUSBUpstreamCandidate, machine.id == kvm.upstreamMachine?.id {
             targetUSB = .upstream
         } else {
             throw ScreenError.message("Focus supports this USB-C Mac and the configured Linux USB-B machine")
@@ -196,7 +199,7 @@ public struct MachineFocusCoordinator {
 
         return MachineFocusResult(
             schemaVersion: 1, machineID: machineID, dryRun: dryRun,
-            targetInput: machine.input, targetUSB: targetUSB,
+            targetInput: input, targetUSB: targetUSB,
             beforeUSB: beforeUSB, afterUSB: afterUSB,
             beforeLayout: beforeLayout, targetLayout: targetLayout, afterLayout: afterLayout,
             usbChanges: usbChanges, videoWriteAttempted: videoWriteAttempted,

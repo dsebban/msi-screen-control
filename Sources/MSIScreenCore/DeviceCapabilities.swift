@@ -1,5 +1,122 @@
 import Foundation
 
+/// One public projection for app handoff and experimental CLI JSON. Backend
+/// states must first pass Core's descriptor/authentication projection; never
+/// feed raw adapter JSON or stderr to this boundary. Signed observation/plan
+/// fields are kept byte-equivalent through round trips (no post-sign redaction).
+public enum DevicePublicJSON {
+    public static func errorCode(_ error: Error) -> String {
+        if let storage = error as? SupportStorageError {
+            switch storage {
+            case .unavailableRoot: return "unavailableRoot"
+            case .unsafeFile: return "unsafeFile"
+            case .busy: return "busyLock"
+            case .corruptKey: return "identityKeyUnavailable"
+            case .corruptRegistry: return "corruptRegistry"
+            case .revisionChanged: return "registryChanged"
+            case .integrityChanged: return "integrityChanged"
+            case .limitExceeded: return "limitExceeded"
+            case .validationPending: return "runtimeQualificationPending"
+            }
+        }
+        if let skill = error as? AgentSkillInstallError {
+            switch skill {
+            case .missingBundle: return "missingSkillBundle"
+            case .conflict: return "skillConflict"
+            case .incompatibleContract: return "unsupportedHostAPI"
+            }
+        }
+        if error is CancellationError { return "cancelled" }
+        if case DeviceContractError.invalid(let code) = error {
+            if code == "unsupportedSchemaOrAPI" { return "unsupportedSchema" }
+            if code == "protectedIdentity" { return "protectedDomain" }
+            return reviewedCode(code)
+        }
+        if let failure = error as? DeviceAdapterFailure { return reviewedCode(failure.code) }
+        return "invalidRequest"
+    }
+    /// Arbitrary diagnostic strings and adapter-supplied codes are local-only.
+    public static func reviewedCode(_ code: String) -> String {
+        // Exact host-owned aliases only; never export arbitrary native diagnostics.
+        switch code {
+        case "hostPath": return "hostUnavailable"
+        case "hostSignatureMismatch": return "hostSignatureChanged"
+        case "hostIntegrityChanged": return "hostBuildChanged"
+        default: break
+        }
+        let known: Set<String> = [
+            "invalidRequest", "localOnly", "unavailableCapability", "attachmentOnly", "identityKeyUnavailable",
+            "absentEndpoint", "ambiguousEndpoint", "staleEndpoint", "ineligibleEndpoint", "invalidEndpointID", "inventoryIncomplete",
+            "absentRequest", "expiredRequest", "wrongHostRequest", "staleRequest", "requestStoreFull", "invalidReplacement",
+            "protectedDomain", "reservedReceiverDomain", "requiredTrustedGuard", "unlistedIdentity", "selectorMismatch", "providerCollision",
+            "providerChanged", "providerDigestChanged", "registryChanged", "staleBinding", "explicitRebindRequired",
+            "unconfiguredDevice", "bindingDisabled", "clipboardUnavailable", "unsupportedControlEndpoint", "runtimeQualificationPending", "executionValidationPending",
+            "missingRetainedPackage", "referencedPackage", "unavailableBindingLeases", "registryFull",
+            "unavailableRoot", "unsafeFile", "busyLock", "corruptRegistry", "integrityChanged", "limitExceeded",
+            "missingSkillBundle", "skillConflict", "unsupportedHostAPI", "unsupportedSchema", "rejectedManifest", "rejectedProfile",
+            "missingNativeSlice", "minimumMacOS", "invalidSignature", "nativeDependenciesOrOS", "nativeSourceReviewRequired",
+            "quarantinedPayload", "executionDenied", "deviceDenied", "adapterProtocolMismatch", "missingReadback",
+            "unauthenticatedObservation", "unauthenticatedPlan", "expiredPlan", "staleBaseline", "staleDomainEpoch",
+            "unavailableVerification", "operationUUIDReused", "planEffectsMismatch", "unverifiedResult",
+            "adapterExit", "adapterSignal", "adapterOutputLimit", "adapterTimeout", "cancelled", "cleanupFailed",
+            "integrityChangedDuringRun", "journalPersistence", "journalFull", "operationIncomplete", "adapterCancelled",
+            "fullReportMismatch", "preservationMismatch", "independentReadMismatch", "applyEvidenceMismatch", "finalConsistencyMismatch",
+            "remoteNotSupported", "invalidArguments", "invalidUTF8OrSize", "nonIntegerNumber", "objectRequired", "size",
+            "hostUnavailable", "hostBuildChanged", "hostSignatureChanged", "runtimeUnavailable", "absentReceipt",
+            "adapterOutputOverflow", "hostWorkerBuildMismatch", "parentLost", "identityMismatch", "deviceAccessDenied", "osExecutionDenied"
+        ]
+        return known.contains(code) ? code : "invalidRequest"
+    }
+    public static func data<T: Encodable>(_ value: T) throws -> Data {
+        let object = try JSONSerialization.jsonObject(with: StrictJSON.canonical(value))
+        // These containers have caller-defined protocol IDs, not member names.
+        // A legal ID such as `name`, `code` or `unit` must never be redacted.
+        let idMaps: Set<String> = ["values", "changes", "unavailable", "guardState", "scopeCommitments", "expectedCommitments", "packages", "slots", "options"]
+        let valueKinds: Set<String> = ["integer", "boolean", "choice", "text", "layout", "usbRoute", "inputMapping"]
+        func project(_ object: Any, idMap: Bool = false) -> Any {
+            if let list = object as? [Any] { return list.map { project($0) } }
+            guard let dictionary = object as? [String: Any] else { return object }
+            if idMap { return dictionary.mapValues { project($0) } }
+            // Typed values have already passed descriptor export classification
+            // before authentication. Their layout/mapping keys are opaque data.
+            if Set(dictionary.keys) == ["kind", "value"], let kind = dictionary["kind"] as? String, valueKinds.contains(kind) { return dictionary }
+            // Inventory source codes are a separate closed enum, not adapter
+            // diagnostics. Its encoder already omits the private OS message.
+            if dictionary["kind"] as? String == "failed", let code = dictionary["code"] as? String,
+               InventoryFailureCode(rawValue: code) != nil, Set(dictionary.keys) == ["kind", "code", "message"] {
+                return ["kind": "failed", "code": code, "message": "Inventory source incomplete"]
+            }
+            var result: [String: Any] = [:]
+            for (key, value) in dictionary {
+                let valueMap = ["before", "target", "after"].contains(key) && (value as? [String: Any]).map { map in
+                    map.values.allSatisfy { ($0 as? [String: Any])?["kind"] is String }
+                } == true
+                if idMaps.contains(key) || valueMap { result[key] = project(value, idMap: true); continue }
+                switch key {
+                case "title", "name": result[key] = "Local-only label"
+                case "unit": continue // Unclassified provider labels are not protocol facts.
+                case "code", "reason":
+                    if let code = value as? String { result[key] = reviewedCode(code) } else { result[key] = project(value) }
+                default: result[key] = project(value)
+                }
+            }
+            return result
+        }
+        return try JSONSerialization.data(withJSONObject: project(object), options: [.sortedKeys, .withoutEscapingSlashes])
+    }
+    public static func unverified(_ receipt: DeviceMutationReceipt) throws -> Data {
+        struct Failure: Encodable {
+            let schema = 1; let code: String; let message = "Device operation is not verified"; let verified = false
+            let identity: DeviceContractIdentity; let receipt: DeviceMutationReceipt
+        }
+        return try data(Failure(code: reviewedCode(receipt.failure?.code ?? "unverifiedResult"), identity: receipt.identity, receipt: receipt))
+    }
+    public static func error(_ error: Error) -> Data {
+        struct Failure: Encodable { let schema = 1; let code: String; let message = "Local experimental command failed"; let verified = false }
+        return try! data(Failure(code: errorCode(error)))
+    }
+}
+
 // These are inert contracts. Authentication, persistence and dispatch belong to
 // the later control runtime; decoding a declaration never authorizes a write.
 public enum DeviceAccess: String, Codable, Sendable { case readOnly, readWrite }

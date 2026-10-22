@@ -1,5 +1,206 @@
 {
   "schema": 1,
+  "u4": {
+    "selector": {
+      "transport": "usb",
+      "vendorID": 1,
+      "productID": 2,
+      "interfaceNumber": 0,
+      "usages": [
+        {
+          "page": 1,
+          "usage": 5
+        }
+      ]
+    },
+    "descriptor": {
+      "capabilities": [
+        {
+          "id": "level",
+          "title": "PRIVATE_USER_LABEL",
+          "category": "setting",
+          "presentationOrder": 0,
+          "access": "readWrite",
+          "definition": {
+            "kind": "integer",
+            "definition": {
+              "minimum": 0,
+              "maximum": 100,
+              "step": 1
+            }
+          },
+          "mutationScopeID": "configuration",
+          "evidenceIDs": [
+            "fixture"
+          ],
+          "executionBudgetMilliseconds": 1000,
+          "settlingMilliseconds": 0,
+          "verification": {
+            "kind": "readback",
+            "guardFieldIDs": [
+              "identity"
+            ],
+            "ownershipRequired": false
+          }
+        }
+      ],
+      "scopes": [
+        {
+          "id": "configuration",
+          "observedFields": [
+            "identity",
+            "level",
+            "reserved"
+          ],
+          "requiredGuardFields": [
+            "identity"
+          ],
+          "writableFields": [
+            "level"
+          ],
+          "coupledFields": [],
+          "preservedFields": [
+            "reserved"
+          ]
+        }
+      ],
+      "evidence": [
+        {
+          "id": "fixture",
+          "kind": "offlineFixture",
+          "title": "PRIVATE_EVIDENCE_LABEL",
+          "exportPolicy": "localOnly"
+        },
+        {
+          "id": "source",
+          "kind": "sourceReview",
+          "title": "Hardware-free owned executable fixture source",
+          "exportPolicy": "sourceReviewedNonpersonal"
+        }
+      ],
+      "supportsLayoutAndUSB": false
+    },
+    "profile": {
+      "schema": 1,
+      "engine": "hid-feature-fields-v1",
+      "reports": [
+        {
+          "id": 0,
+          "length": 4,
+          "safeToRoundTrip": true
+        }
+      ],
+      "fields": [
+        {
+          "id": "identity",
+          "reportID": 0,
+          "offset": 0,
+          "width": 1,
+          "codec": "u8",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {},
+          "writable": false
+        },
+        {
+          "id": "level",
+          "reportID": 0,
+          "offset": 1,
+          "width": 1,
+          "codec": "u8",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {},
+          "writable": true
+        },
+        {
+          "id": "reserved",
+          "reportID": 0,
+          "offset": 2,
+          "width": 2,
+          "codec": "u16BE",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {},
+          "writable": false
+        }
+      ],
+      "identities": {
+        "identity": [
+          {
+            "kind": "integer",
+            "value": 42
+          }
+        ]
+      },
+      "guards": [
+        {
+          "fieldID": "identity",
+          "kind": "equals",
+          "values": [
+            {
+              "kind": "integer",
+              "value": 42
+            }
+          ]
+        }
+      ],
+      "capabilities": [
+        {
+          "capabilityID": "level",
+          "components": {
+            "value": "level"
+          }
+        }
+      ],
+      "fixtures": [
+        {
+          "reports": {
+            "0": "2a05cafe"
+          },
+          "expectedValues": {
+            "level": {
+              "kind": "integer",
+              "value": 5
+            }
+          },
+          "operation": {
+            "kind": "setCapability",
+            "capabilityID": "level",
+            "target": {
+              "kind": "integer",
+              "value": 20
+            }
+          },
+          "expectedReports": {
+            "0": "2a14cafe"
+          }
+        },
+        {
+          "reports": {
+            "0": "2a05cafe"
+          },
+          "expectedValues": {
+            "level": {
+              "kind": "integer",
+              "value": 5
+            }
+          },
+          "operation": {
+            "kind": "setCapability",
+            "capabilityID": "level",
+            "target": {
+              "kind": "integer",
+              "value": 5
+            }
+          },
+          "expectedReports": {
+            "0": "2a05cafe"
+          }
+        }
+      ]
+    }
+  },
   "validValues": [
     "{\"kind\":\"integer\",\"value\":-9223372036854775808}",
     "{\"kind\":\"boolean\",\"value\":false}",
@@ -11,5 +212,1016 @@
     "{\"kind\":\"integer\",\"value\":1e0}",
     "{\"kind\":\"boolean\",\"value\":false,\"v\\u0061lue\":true}",
     "{\"kind\":\"layout\",\"value\":{\"templateID\":\"wide\",\"slots\":{},\"options\":{},\"private\":\"not allowed\"}}"
-  ]
+  ],
+  "u5": {
+    "selector": {
+      "transport": "bluetooth",
+      "vendorID": 65534,
+      "productID": 65264,
+      "interfaceNumber": 0,
+      "usages": [
+        {
+          "page": 1,
+          "usage": 5
+        }
+      ]
+    },
+    "descriptor": {
+      "capabilities": [
+        {
+          "id": "level",
+          "title": "Level",
+          "category": "setting",
+          "presentationOrder": 0,
+          "access": "readWrite",
+          "definition": {
+            "kind": "integer",
+            "definition": {
+              "minimum": 0,
+              "maximum": 100,
+              "step": 1
+            }
+          },
+          "mutationScopeID": "configuration",
+          "evidenceIDs": [
+            "fixture"
+          ],
+          "executionBudgetMilliseconds": 5000,
+          "settlingMilliseconds": 0,
+          "verification": {
+            "kind": "readback",
+            "guardFieldIDs": [
+              "identity",
+              "guard"
+            ],
+            "ownershipRequired": false
+          }
+        },
+        {
+          "id": "enabled",
+          "title": "Enabled",
+          "category": "setting",
+          "presentationOrder": 1,
+          "access": "readWrite",
+          "definition": {
+            "kind": "boolean"
+          },
+          "mutationScopeID": "configuration",
+          "evidenceIDs": [
+            "fixture"
+          ],
+          "executionBudgetMilliseconds": 5000,
+          "settlingMilliseconds": 0,
+          "verification": {
+            "kind": "readback",
+            "guardFieldIDs": [
+              "identity",
+              "guard"
+            ],
+            "ownershipRequired": false
+          }
+        },
+        {
+          "id": "layout",
+          "title": "Layout",
+          "category": "layout",
+          "presentationOrder": 2,
+          "access": "readWrite",
+          "definition": {
+            "kind": "layout",
+            "definition": {
+              "inputs": [
+                {
+                  "id": "alpha",
+                  "title": "Alpha"
+                },
+                {
+                  "id": "beta",
+                  "title": "Beta"
+                }
+              ],
+              "templates": [
+                {
+                  "id": "single",
+                  "title": "Single",
+                  "slots": [
+                    {
+                      "id": "main",
+                      "rectangle": {
+                        "x": 0,
+                        "y": 0,
+                        "width": 5000,
+                        "height": 10000,
+                        "z": 0
+                      },
+                      "allowedInputIDs": [
+                        "alpha",
+                        "beta"
+                      ]
+                    }
+                  ],
+                  "distinctInputs": false
+                },
+                {
+                  "id": "pair",
+                  "title": "Pair",
+                  "slots": [
+                    {
+                      "id": "main",
+                      "rectangle": {
+                        "x": 0,
+                        "y": 0,
+                        "width": 5000,
+                        "height": 10000,
+                        "z": 0
+                      },
+                      "allowedInputIDs": [
+                        "alpha",
+                        "beta"
+                      ]
+                    },
+                    {
+                      "id": "sub",
+                      "rectangle": {
+                        "x": 5000,
+                        "y": 0,
+                        "width": 5000,
+                        "height": 10000,
+                        "z": 1
+                      },
+                      "allowedInputIDs": [
+                        "alpha",
+                        "beta"
+                      ]
+                    }
+                  ],
+                  "distinctInputs": true
+                }
+              ],
+              "options": [
+                {
+                  "id": "ratio",
+                  "choices": [
+                    {
+                      "id": "equal",
+                      "title": "Equal"
+                    },
+                    {
+                      "id": "wide",
+                      "title": "Wide"
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          "mutationScopeID": "configuration",
+          "evidenceIDs": [
+            "fixture"
+          ],
+          "executionBudgetMilliseconds": 5000,
+          "settlingMilliseconds": 0,
+          "verification": {
+            "kind": "readback",
+            "guardFieldIDs": [
+              "identity",
+              "guard"
+            ],
+            "ownershipRequired": false
+          }
+        },
+        {
+          "id": "route",
+          "title": "Route",
+          "category": "usb",
+          "presentationOrder": 3,
+          "access": "readWrite",
+          "definition": {
+            "kind": "usbRoute",
+            "definition": {
+              "destinations": [
+                {
+                  "id": "alpha",
+                  "title": "Alpha"
+                },
+                {
+                  "id": "beta",
+                  "title": "Beta"
+                }
+              ],
+              "affectedDomainID": "configuration",
+              "reachability": "remainsReachable"
+            }
+          },
+          "mutationScopeID": "configuration",
+          "evidenceIDs": [
+            "fixture"
+          ],
+          "executionBudgetMilliseconds": 5000,
+          "settlingMilliseconds": 0,
+          "verification": {
+            "kind": "configuredRoute",
+            "guardFieldIDs": [
+              "identity",
+              "guard"
+            ],
+            "ownershipRequired": false
+          }
+        },
+        {
+          "id": "mapping",
+          "title": "Mapping",
+          "category": "input",
+          "presentationOrder": 4,
+          "access": "readWrite",
+          "definition": {
+            "kind": "inputMapping",
+            "definition": {
+              "controls": [
+                {
+                  "id": "a",
+                  "title": "A"
+                },
+                {
+                  "id": "b",
+                  "title": "B"
+                }
+              ],
+              "actions": [
+                {
+                  "id": "next",
+                  "title": "Next"
+                },
+                {
+                  "id": "mute",
+                  "title": "Mute"
+                }
+              ]
+            }
+          },
+          "mutationScopeID": "configuration",
+          "evidenceIDs": [
+            "fixture"
+          ],
+          "executionBudgetMilliseconds": 5000,
+          "settlingMilliseconds": 0,
+          "verification": {
+            "kind": "readback",
+            "guardFieldIDs": [
+              "identity",
+              "guard"
+            ],
+            "ownershipRequired": false
+          }
+        }
+      ],
+      "scopes": [
+        {
+          "id": "configuration",
+          "observedFields": [
+            "identity",
+            "level",
+            "enabled",
+            "template",
+            "main",
+            "sub",
+            "ratio",
+            "route",
+            "a",
+            "b",
+            "guard",
+            "reserved"
+          ],
+          "requiredGuardFields": [
+            "identity",
+            "guard"
+          ],
+          "writableFields": [
+            "level",
+            "enabled",
+            "template",
+            "main",
+            "sub",
+            "ratio",
+            "route",
+            "a",
+            "b"
+          ],
+          "coupledFields": [],
+          "preservedFields": [
+            "reserved"
+          ]
+        }
+      ],
+      "evidence": [
+        {
+          "id": "fixture",
+          "kind": "offlineFixture",
+          "title": "Isolated non-hardware fixture",
+          "exportPolicy": "sourceReviewedNonpersonal"
+        },
+        {
+          "id": "source",
+          "kind": "sourceReview",
+          "title": "Source-reviewed file-only fixture; native code is not sandboxed",
+          "exportPolicy": "sourceReviewedNonpersonal"
+        }
+      ],
+      "supportsLayoutAndUSB": true
+    },
+    "profile": {
+      "schema": 1,
+      "engine": "hid-feature-fields-v1",
+      "reports": [
+        {
+          "id": 0,
+          "length": 16,
+          "safeToRoundTrip": true
+        }
+      ],
+      "fields": [
+        {
+          "id": "identity",
+          "reportID": 0,
+          "offset": 0,
+          "width": 1,
+          "codec": "u8",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {},
+          "writable": false
+        },
+        {
+          "id": "level",
+          "reportID": 0,
+          "offset": 1,
+          "width": 1,
+          "codec": "u8",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {},
+          "writable": true
+        },
+        {
+          "id": "enabled",
+          "reportID": 0,
+          "offset": 2,
+          "width": 1,
+          "codec": "bits",
+          "bitOffset": 0,
+          "bitCount": 1,
+          "enumBytes": {},
+          "writable": true
+        },
+        {
+          "id": "template",
+          "reportID": 0,
+          "offset": 3,
+          "width": 1,
+          "codec": "enumBytes",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {
+            "single": "00",
+            "pair": "01"
+          },
+          "writable": true
+        },
+        {
+          "id": "main",
+          "reportID": 0,
+          "offset": 4,
+          "width": 1,
+          "codec": "enumBytes",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {
+            "alpha": "00",
+            "beta": "01"
+          },
+          "writable": true
+        },
+        {
+          "id": "sub",
+          "reportID": 0,
+          "offset": 5,
+          "width": 1,
+          "codec": "enumBytes",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {
+            "alpha": "00",
+            "beta": "01"
+          },
+          "writable": true
+        },
+        {
+          "id": "ratio",
+          "reportID": 0,
+          "offset": 6,
+          "width": 1,
+          "codec": "enumBytes",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {
+            "equal": "00",
+            "wide": "01"
+          },
+          "writable": true
+        },
+        {
+          "id": "route",
+          "reportID": 0,
+          "offset": 7,
+          "width": 1,
+          "codec": "enumBytes",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {
+            "alpha": "00",
+            "beta": "01"
+          },
+          "writable": true
+        },
+        {
+          "id": "a",
+          "reportID": 0,
+          "offset": 8,
+          "width": 1,
+          "codec": "enumBytes",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {
+            "next": "00",
+            "mute": "01"
+          },
+          "writable": true
+        },
+        {
+          "id": "b",
+          "reportID": 0,
+          "offset": 9,
+          "width": 1,
+          "codec": "enumBytes",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {
+            "next": "00",
+            "mute": "01"
+          },
+          "writable": true
+        },
+        {
+          "id": "guard",
+          "reportID": 0,
+          "offset": 10,
+          "width": 1,
+          "codec": "u8",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {},
+          "writable": false
+        },
+        {
+          "id": "reserved",
+          "reportID": 0,
+          "offset": 11,
+          "width": 2,
+          "codec": "u16BE",
+          "bitOffset": 0,
+          "bitCount": 0,
+          "enumBytes": {},
+          "writable": false
+        }
+      ],
+      "identities": {
+        "identity": [
+          {
+            "kind": "integer",
+            "value": 42
+          }
+        ]
+      },
+      "guards": [
+        {
+          "fieldID": "guard",
+          "kind": "equals",
+          "values": [
+            {
+              "kind": "integer",
+              "value": 7
+            }
+          ]
+        }
+      ],
+      "capabilities": [
+        {
+          "capabilityID": "level",
+          "components": {
+            "value": "level"
+          }
+        },
+        {
+          "capabilityID": "enabled",
+          "components": {
+            "value": "enabled"
+          }
+        },
+        {
+          "capabilityID": "layout",
+          "components": {
+            "template": "template",
+            "slot.main": "main",
+            "slot.sub": "sub",
+            "option.ratio": "ratio"
+          }
+        },
+        {
+          "capabilityID": "route",
+          "components": {
+            "destination": "route"
+          }
+        },
+        {
+          "capabilityID": "mapping",
+          "components": {
+            "control.a": "a",
+            "control.b": "b"
+          }
+        }
+      ],
+      "fixtures": [
+        {
+          "reports": {
+            "0": "2a05000000010000000107cafe000000"
+          },
+          "expectedValues": {
+            "level": {
+              "kind": "integer",
+              "value": 5
+            },
+            "enabled": {
+              "kind": "boolean",
+              "value": false
+            },
+            "layout": {
+              "kind": "layout",
+              "value": {
+                "templateID": "single",
+                "slots": {
+                  "main": "alpha"
+                },
+                "options": {
+                  "ratio": "equal"
+                }
+              }
+            },
+            "route": {
+              "kind": "usbRoute",
+              "value": {
+                "configuredDestinationID": "alpha"
+              }
+            },
+            "mapping": {
+              "kind": "inputMapping",
+              "value": {
+                "a": "next",
+                "b": "mute"
+              }
+            }
+          },
+          "operation": {
+            "kind": "setCapability",
+            "capabilityID": "level",
+            "target": {
+              "kind": "integer",
+              "value": 20
+            }
+          },
+          "expectedReports": {
+            "0": "2a14000000010000000107cafe000000"
+          }
+        },
+        {
+          "reports": {
+            "0": "2a05000000010000000107cafe000000"
+          },
+          "expectedValues": {
+            "level": {
+              "kind": "integer",
+              "value": 5
+            },
+            "enabled": {
+              "kind": "boolean",
+              "value": false
+            },
+            "layout": {
+              "kind": "layout",
+              "value": {
+                "templateID": "single",
+                "slots": {
+                  "main": "alpha"
+                },
+                "options": {
+                  "ratio": "equal"
+                }
+              }
+            },
+            "route": {
+              "kind": "usbRoute",
+              "value": {
+                "configuredDestinationID": "alpha"
+              }
+            },
+            "mapping": {
+              "kind": "inputMapping",
+              "value": {
+                "a": "next",
+                "b": "mute"
+              }
+            }
+          },
+          "operation": {
+            "kind": "setCapability",
+            "capabilityID": "enabled",
+            "target": {
+              "kind": "boolean",
+              "value": true
+            }
+          },
+          "expectedReports": {
+            "0": "2a05010000010000000107cafe000000"
+          }
+        },
+        {
+          "reports": {
+            "0": "2a05000000010000000107cafe000000"
+          },
+          "expectedValues": {
+            "level": {
+              "kind": "integer",
+              "value": 5
+            },
+            "enabled": {
+              "kind": "boolean",
+              "value": false
+            },
+            "layout": {
+              "kind": "layout",
+              "value": {
+                "templateID": "single",
+                "slots": {
+                  "main": "alpha"
+                },
+                "options": {
+                  "ratio": "equal"
+                }
+              }
+            },
+            "route": {
+              "kind": "usbRoute",
+              "value": {
+                "configuredDestinationID": "alpha"
+              }
+            },
+            "mapping": {
+              "kind": "inputMapping",
+              "value": {
+                "a": "next",
+                "b": "mute"
+              }
+            }
+          },
+          "operation": {
+            "kind": "setLayout",
+            "capabilityID": "layout",
+            "target": {
+              "kind": "layout",
+              "value": {
+                "templateID": "pair",
+                "slots": {
+                  "main": "alpha",
+                  "sub": "beta"
+                },
+                "options": {
+                  "ratio": "equal"
+                }
+              }
+            }
+          },
+          "expectedReports": {
+            "0": "2a05000100010000000107cafe000000"
+          }
+        },
+        {
+          "reports": {
+            "0": "2a05000000010000000107cafe000000"
+          },
+          "expectedValues": {
+            "level": {
+              "kind": "integer",
+              "value": 5
+            },
+            "enabled": {
+              "kind": "boolean",
+              "value": false
+            },
+            "layout": {
+              "kind": "layout",
+              "value": {
+                "templateID": "single",
+                "slots": {
+                  "main": "alpha"
+                },
+                "options": {
+                  "ratio": "equal"
+                }
+              }
+            },
+            "route": {
+              "kind": "usbRoute",
+              "value": {
+                "configuredDestinationID": "alpha"
+              }
+            },
+            "mapping": {
+              "kind": "inputMapping",
+              "value": {
+                "a": "next",
+                "b": "mute"
+              }
+            }
+          },
+          "operation": {
+            "kind": "setUSBRoute",
+            "capabilityID": "route",
+            "target": {
+              "kind": "usbRoute",
+              "value": {
+                "configuredDestinationID": "beta"
+              }
+            }
+          },
+          "expectedReports": {
+            "0": "2a05000000010001000107cafe000000"
+          }
+        },
+        {
+          "reports": {
+            "0": "2a05000000010000000107cafe000000"
+          },
+          "expectedValues": {
+            "level": {
+              "kind": "integer",
+              "value": 5
+            },
+            "enabled": {
+              "kind": "boolean",
+              "value": false
+            },
+            "layout": {
+              "kind": "layout",
+              "value": {
+                "templateID": "single",
+                "slots": {
+                  "main": "alpha"
+                },
+                "options": {
+                  "ratio": "equal"
+                }
+              }
+            },
+            "route": {
+              "kind": "usbRoute",
+              "value": {
+                "configuredDestinationID": "alpha"
+              }
+            },
+            "mapping": {
+              "kind": "inputMapping",
+              "value": {
+                "a": "next",
+                "b": "mute"
+              }
+            }
+          },
+          "operation": {
+            "kind": "setInputMapping",
+            "capabilityID": "mapping",
+            "target": {
+              "kind": "inputMapping",
+              "value": {
+                "a": "mute",
+                "b": "next"
+              }
+            }
+          },
+          "expectedReports": {
+            "0": "2a05000000010000010007cafe000000"
+          }
+        },
+        {
+          "reports": {
+            "0": "2a05000000010000000107cafe000000"
+          },
+          "expectedValues": {
+            "level": {
+              "kind": "integer",
+              "value": 5
+            },
+            "enabled": {
+              "kind": "boolean",
+              "value": false
+            },
+            "layout": {
+              "kind": "layout",
+              "value": {
+                "templateID": "single",
+                "slots": {
+                  "main": "alpha"
+                },
+                "options": {
+                  "ratio": "equal"
+                }
+              }
+            },
+            "route": {
+              "kind": "usbRoute",
+              "value": {
+                "configuredDestinationID": "alpha"
+              }
+            },
+            "mapping": {
+              "kind": "inputMapping",
+              "value": {
+                "a": "next",
+                "b": "mute"
+              }
+            }
+          },
+          "operation": {
+            "kind": "setCapability",
+            "capabilityID": "level",
+            "target": {
+              "kind": "integer",
+              "value": 5
+            }
+          },
+          "expectedReports": {
+            "0": "2a05000000010000000107cafe000000"
+          }
+        }
+      ]
+    },
+    "reports": {
+      "0": "2a05000000010000000107cafe000000"
+    },
+    "nativeState": {
+      "values": {
+        "level": {
+          "kind": "integer",
+          "value": 5
+        },
+        "enabled": {
+          "kind": "boolean",
+          "value": false
+        },
+        "layout": {
+          "kind": "layout",
+          "value": {
+            "templateID": "single",
+            "slots": {
+              "main": "alpha"
+            },
+            "options": {
+              "ratio": "equal"
+            }
+          }
+        },
+        "route": {
+          "kind": "usbRoute",
+          "value": {
+            "configuredDestinationID": "alpha"
+          }
+        },
+        "mapping": {
+          "kind": "inputMapping",
+          "value": {
+            "a": "next",
+            "b": "mute"
+          }
+        }
+      },
+      "fields": {
+        "identity": {
+          "kind": "integer",
+          "value": 42
+        },
+        "level": {
+          "kind": "integer",
+          "value": 5
+        },
+        "enabled": {
+          "kind": "integer",
+          "value": 0
+        },
+        "guard": {
+          "kind": "integer",
+          "value": 7
+        },
+        "reserved": {
+          "kind": "integer",
+          "value": 51966
+        },
+        "template": {
+          "kind": "choice",
+          "value": "single"
+        },
+        "main": {
+          "kind": "choice",
+          "value": "alpha"
+        },
+        "sub": {
+          "kind": "choice",
+          "value": "beta"
+        },
+        "ratio": {
+          "kind": "choice",
+          "value": "equal"
+        },
+        "route": {
+          "kind": "choice",
+          "value": "alpha"
+        },
+        "a": {
+          "kind": "choice",
+          "value": "next"
+        },
+        "b": {
+          "kind": "choice",
+          "value": "mute"
+        }
+      },
+      "preservation": {
+        "opaque": "cafe"
+      },
+      "unavailable": {}
+    },
+    "operations": [
+      {
+        "kind": "setCapability",
+        "capabilityID": "level",
+        "target": {
+          "kind": "integer",
+          "value": 20
+        }
+      },
+      {
+        "kind": "setCapability",
+        "capabilityID": "enabled",
+        "target": {
+          "kind": "boolean",
+          "value": true
+        }
+      },
+      {
+        "kind": "setLayout",
+        "capabilityID": "layout",
+        "target": {
+          "kind": "layout",
+          "value": {
+            "templateID": "pair",
+            "slots": {
+              "main": "alpha",
+              "sub": "beta"
+            },
+            "options": {
+              "ratio": "equal"
+            }
+          }
+        }
+      },
+      {
+        "kind": "setUSBRoute",
+        "capabilityID": "route",
+        "target": {
+          "kind": "usbRoute",
+          "value": {
+            "configuredDestinationID": "beta"
+          }
+        }
+      },
+      {
+        "kind": "setInputMapping",
+        "capabilityID": "mapping",
+        "target": {
+          "kind": "inputMapping",
+          "value": {
+            "a": "mute",
+            "b": "next"
+          }
+        }
+      }
+    ]
+  }
 }

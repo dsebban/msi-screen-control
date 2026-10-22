@@ -34,7 +34,10 @@ func nativeFixture() throws {
         let facts: [String: Any] = ["pid": getpid(), "parent": getppid(), "group": getpgrp(),
             "lease": fcntl(210, F_GETFD) >= 0, "sentinel": fcntl(199, F_GETFD) >= 0,
             "environment": ProcessInfo.processInfo.environment, "operation": request["operation"]!]
-        try JSONSerialization.data(withJSONObject: facts, options: [.sortedKeys]).write(to: URL(fileURLWithPath: marker))
+        let event = try JSONSerialization.data(withJSONObject: facts, options: [.sortedKeys])
+        try event.write(to: URL(fileURLWithPath: marker))
+        let trace = open(marker + ".events", O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        if trace >= 0 { (event + Data([10])).withUnsafeBytes { _ = write(trace, $0.baseAddress!, $0.count) }; close(trace) }
     }
     let deadline = request["deadlineUptimeMilliseconds"] as! Int64
     func alive() -> Bool {
@@ -61,6 +64,7 @@ func nativeFixture() throws {
         for string in strings { free(string) }; posix_spawn_file_actions_destroy(&actions); posix_spawnattr_destroy(&attributes)
         while !FileManager.default.fileExists(atPath: childMarker) && alive() { usleep(1000) }
     }
+    if mode == "privateDiagnostic" { emit("PRIVATE_USER /Users/private/secret SERIAL-PRIVATE", to: STDERR_FILENO); exit(17) }
     if mode == "nonzero" { exit(17) }
     if mode == "malformed" { emit("{bad"); exit(0) }
     if mode == "mutate" { try Data("changed".utf8).write(to: configURL) }
@@ -120,6 +124,10 @@ func nativeFixture() throws {
             result = ["kind": "rejected", "failure": ["code": "staleBaseline"]]; break
         }
         guard alive() else { exit(71) }
+        if let delay = config["applyDelayMilliseconds"] as? Int, (0...2000).contains(delay) {
+            let end = ProcessInfo.processInfo.systemUptime + Double(delay) / 1000
+            while ProcessInfo.processInfo.systemUptime < end { guard alive() else { exit(71) }; usleep(1000) }
+        }
         let plan = payload["plan"] as! [String: Any], operation = plan["operation"] as! [String: Any]
         let id = operation["capabilityID"] as! String, target = operation["target"] as! [String: Any]
         var values = current["values"] as! [String: Any], fields = current["fields"] as! [String: Any]
@@ -151,9 +159,15 @@ func nativeFixture() throws {
         result["result"] = ["before": before, "after": current, "attempted": true, "completed": true, "acknowledged": true]
     default: exit(64)
     }
+    // Negative cleanup evidence is deliberate semantic fixture data, not an
+    // escaped child: exercise propagation without leaving an unsafe process.
+    if mode == "cleanupFalseMutation" || mode == "cleanupFalseCorrelation" {
+        result = ["kind": "failed", "failure": ["code": "cleanupFailed", "dispatched": false, "cleanupConfirmed": false]]
+        if mode == "cleanupFalseMutation" { try Data("changed".utf8).write(to: configURL) }
+    }
     var response: [String: Any] = ["schema": 1, "hostAPI": 1, "buildIdentity": request["buildIdentity"]!, "requestID": request["requestID"]!,
         "providerDigest": request["providerDigest"]!, "operation": operation, "result": result]
-    if mode == "wrongRequest" { response["requestID"] = UUID().uuidString }
+    if mode == "wrongRequest" || mode == "cleanupFalseCorrelation" { response["requestID"] = UUID().uuidString }
     if mode == "unknownKey" { response["private"] = "not-allowed" }
     FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: response, options: [.sortedKeys]))
 }

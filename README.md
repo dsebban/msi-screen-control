@@ -19,7 +19,7 @@ The [MD342CQP manual](https://download-2.msi.com/archive/mnu_exe/monitor/MD342CQ
 
 ## Install
 
-Download the **v0.2.0 universal DMG** from [Releases](https://github.com/dsebban/msi-screen-control/releases/latest). It supports Apple silicon and Intel Macs running macOS 13 or later. Open the DMG, quit any running MSI Screen, and drag **MSI Screen.app** onto **Applications**. Eject the disk, then open the installed app. For an upgrade, replace the existing copy in its current Applications folder rather than keeping duplicates.
+Download the **v0.3.0 universal DMG** from [Releases](https://github.com/dsebban/msi-screen-control/releases/latest). It supports Apple silicon and Intel Macs running macOS 13 or later. Open the DMG, quit any running MSI Screen, and drag **MSI Screen.app** onto **Applications**. Eject the disk, then open the installed app. For an upgrade, replace the existing copy in its current Applications folder rather than keeping duplicates.
 
 The app and DMG are **Developer ID signed and notarized**, with stapled Apple tickets. The universal ZIP contains the same notarized app; `SHA256SUMS` verifies the downloads. The older v0.1.0 ZIPs are ad hoc signed and not notarized.
 
@@ -119,7 +119,9 @@ F20 and the wheel controls are independent: restoring horizontal scrolling leave
 
 **Read keyboard details** checks the selected POP receiver pairing and reads its reported battery, firmware, Fn-row mode and control mappings when available. Missing or partial data remains visible; wake the keyboard on its receiver channel if it cannot respond. Receiver slots are pairing records, not Easy-Switch channels, and multiple records can refer to one keyboard. Device-reported mappings can differ from Logi Options+ actions. These reads do not change pairings, channels or mappings.
 
-**Universal Control · Macs only** optionally uses an already installed `~/.local/bin/universal-control` helper. **Check** reads service health, **Reconnect** runs that helper's reconnect operation, and **Settings…** opens macOS Displays for Universal Control preferences. There is no public enable/disable toggle in this app. Service health does not prove pointer or keyboard transfer; test crossing between both Macs. The helper uses its own existing configuration, independently of the display companion's SSH alias.
+**Universal Control · Macs only** lets you choose the **Shared Mac** already linked in macOS. The Layout preview and machine cards show that configured keyboard/mouse link, including when the other Mac is off screen. It remains independent of the monitor's wired USB route. The optional already installed `~/.local/bin/universal-control` helper provides **Check** for service health and **Reconnect** for its reconnect operation; **Settings…** opens macOS Displays. The Shared Mac setting does not enable macOS sharing or measure live connectivity. Service health does not prove pointer or keyboard transfer; test crossing between both Macs. The helper uses its own existing configuration, independently of the display companion's SSH alias.
+
+The Layout preview also shows machine names and ports for the selected inputs and other assigned computers off screen. Draft changes stay labelled until Apply, while USB ownership follows a fresh route readback. **Discovered via Tailscale** lists tailnet computers, including offline peers; configure their video inputs explicitly because network discovery cannot identify monitor cables. Machine SSH transport can use standard SSH or native Tailscale SSH. Saving machine configuration uses registry schema 3; older versions refuse that newer schema.
 
 ## CLI and agent use
 

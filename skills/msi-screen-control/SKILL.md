@@ -1,6 +1,8 @@
 ---
 name: msi-screen-control
 description: Control the MSI MD342CQP monitor through the installed msi-screen CLI, including PBP layouts, source selection, monitor settings, USB routing, saved computers, and supported peripherals. Use for this monitor's operation, not firmware flashing or arbitrary MSI models.
+metadata:
+  msi-screen-host-api: "1"
 ---
 
 # MSI Screen Control
@@ -21,6 +23,16 @@ fi
 If neither app exists, locate `msi-screen` on PATH or use an explicitly selected source build. Do not download or build a replacement implicitly. `capabilities` is hardware-free JSON: use it and `--help` as the installed version's command contract. Older versions may lack commands shown here. Other commands return JSON and a nonzero exit status on failure.
 
 Read `status` before local monitor mutations; it must identify `MD342CQP` / `V20`. If available, `identity` reads model/firmware identifiers without model-specific setting probes. A shared USB product ID does not establish compatibility. A disconnected controller is unavailable, not evidence that a remembered layout is still active.
+
+## Discover other local devices
+
+When `capabilities.experimental` is present, `devices list` passively inventories screens and peripherals even without an MSI controller. Use exact **endpoint** IDs, not record IDs or ordinal guesses. `devices inspect ID` gives passive facts, declared controls, binding and availability; partial sources are not absence. A USB control endpoint need not have a known video-display association.
+
+For missing protocol support, `devices support-request ID` checks/installs the exact bundled `write-addhoc-support` skill and returns a redacted prompt for the existing agent; it does not launch an agent or change the clipboard. New skills may appear next turn; read `~/.agents/skills/write-addhoc-support/SKILL.md` locally if not yet indexed. A skill conflict preserves user content and stops handoff. Keep private request resolution/diagnostics local; do not upload identifiers.
+
+Experimental Read/plan/apply remain unavailable while `executionReady:false` (`runtimeQualificationPending`); metadata lifecycle, historical receipts and hardware-free validation/selfTest remain available, with no production override. After recorded qualification gates close, explicit `devices read ID` supplies an authenticated baseline for an already configured endpoint. Submit `{"schema":1,"kind":"plan","observation":OBSERVATION,"operation":OPERATION}` to `devices request` for a hardware-free plan, then `{"schema":1,"kind":"apply","plan":PLAN}` for the user's intended mutation. Preserve complete authenticated JSON, including commitments; never edit or regenerate authentication. Read receipts with `support receipt UUID`, never resume/retry an uncertain operation. Nonzero/unverified means stop and report partial evidence. Follow the installed help/descriptor for device-local IDs, complete layouts/options/routes/mappings—not MSI enums or implicit follow-USB.
+
+`support list` shows retained digests/bindings and qualification gates. `support bind` rebinds retained support to an exact newly selected attachment without regeneration or hardware I/O. Bind/disable/activate/remove support checked metadata `--dry-run`; activation does not restore hardware. Native support runs as the user, not in a sandbox. Operational qualification gates must not be bypassed. Experimental activation never expands this skill's MD342CQP/V20 built-in compatibility claim.
 
 ## Apply an explicit desired state
 

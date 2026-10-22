@@ -101,12 +101,15 @@ struct GameControllersView: View {
             }.controlSize(.small)
             Text("Bluetooth stays with its paired Mac when you switch the monitor’s USB host.")
                 .font(.caption2).foregroundStyle(.secondary)
-            DisclosureGroup("BSP-D8 connection modes") {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Yellow: Android mode. For Xbox mode, power off, then hold RB + Home for 2 seconds. Pair “Xbox Wireless Controller” when the light flashes cyan.")
-                    Link("D8 manual", destination: URL(string: "https://manuals.plus/m/cb5c51d89dc614d945421230e99b5b8a426413cc951478aa6d82794bfc550580.pdf")!)
-                }.font(.caption2).padding(.top, 5)
-            }.font(.caption)
+
+            if snapshot?.devices.contains(where: { $0.name == "BSP-D8" }) == true {
+                DisclosureGroup("BSP-D8 connection modes") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Yellow: Android mode. For Xbox mode, power off, then hold RB + Home for 2 seconds. Pair “Xbox Wireless Controller” when the light flashes cyan.")
+                        Link("D8 manual", destination: URL(string: "https://manuals.plus/m/cb5c51d89dc614d945421230e99b5b8a426413cc951478aa6d82794bfc550580.pdf")!)
+                    }.font(.caption2).padding(.top, 5)
+                }.font(.caption)
+            }
         }
         .monitorCard(tint: .mint, inset: 12)
         .task { await refresh() }

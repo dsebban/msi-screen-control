@@ -16,6 +16,14 @@ struct USBDeviceNode: Equatable, Sendable {
     let rootHub: Bool
     let name: String?
     let serial: String?
+    let isBuiltIn: Bool?
+
+    init(id: UInt64, parentID: UInt64?, vendor: Int?, product: Int?, deviceClass: Int,
+         rootHub: Bool, name: String?, serial: String?, isBuiltIn: Bool? = nil) {
+        self.id = id; self.parentID = parentID; self.vendor = vendor; self.product = product
+        self.deviceClass = deviceClass; self.rootHub = rootHub; self.name = name; self.serial = serial
+        self.isBuiltIn = isBuiltIn
+    }
 
     var peripheralProjection: PeripheralUSBDevice? {
         guard let vendor, let product else { return nil }
@@ -34,6 +42,15 @@ struct HIDDeviceNode: Equatable, Sendable {
     let name: String?
     let serial: String?
     let usages: [DeviceUsage]
+    let isBuiltIn: Bool?
+
+    init(id: UInt64, usbDeviceID: UInt64?, interfaceID: UInt64?, interfaceNumber: UInt8?,
+         transport: DeviceTransport, vendor: Int?, product: Int?, name: String?, serial: String?,
+         usages: [DeviceUsage], isBuiltIn: Bool? = nil) {
+        self.id = id; self.usbDeviceID = usbDeviceID; self.interfaceID = interfaceID; self.interfaceNumber = interfaceNumber
+        self.transport = transport; self.vendor = vendor; self.product = product; self.name = name; self.serial = serial
+        self.usages = usages; self.isBuiltIn = isBuiltIn
+    }
 }
 
 /// Shared enumeration/ancestry only. No HID objects, opens, callbacks, reports,
@@ -68,7 +85,8 @@ struct USBDeviceGraph: Sendable {
             devices.append(USBDeviceNode(id: id, parentID: ancestor(service, className: "IOUSBHostDevice", includingSelf: false),
                 vendor: number(service, "idVendor"), product: number(service, "idProduct"), deviceClass: number(service, "bDeviceClass") ?? -1,
                 rootHub: IOObjectConformsTo(service, "AppleUSBRootHubDevice") != 0,
-                name: string(service, "USB Product Name"), serial: string(service, "USB Serial Number")))
+                name: string(service, "USB Product Name"), serial: string(service, "USB Serial Number"),
+                isBuiltIn: number(service, "Built-In").map { $0 != 0 }))
         }
         return InventorySourceSlice(devices.sorted { $0.id < $1.id }, outcome: incomplete
             ? .failed(code: .identityUnavailable, message: "Some USB identities are unavailable") : .complete)
@@ -98,24 +116,28 @@ struct USBDeviceGraph: Sendable {
             let transport: DeviceTransport
             switch string(service, "Transport") {
             case "USB": transport = .usb
-            case "Bluetooth", "Bluetooth Low Energy": transport = .bluetooth
+            case "Bluetooth", "Bluetooth Low Energy", "BluetoothLowEnergy": transport = .bluetooth
             default: transport = .other
             }
             devices.append(HIDDeviceNode(id: id, usbDeviceID: ancestor(service, className: "IOUSBHostDevice", includingSelf: true),
                 interfaceID: ifaceID, interfaceNumber: ifaceNumber.flatMap(UInt8.init(exactly:)), transport: transport,
                 vendor: number(service, "VendorID"), product: number(service, "ProductID"),
                 name: string(service, "Product"), serial: string(service, "SerialNumber"),
-                usages: usages.sorted { ($0.page, $0.usage) < ($1.page, $1.usage) }))
+                usages: usages.sorted { ($0.page, $0.usage) < ($1.page, $1.usage) },
+                isBuiltIn: number(service, "Built-In").map { $0 != 0 }))
         }
         return InventorySourceSlice(devices.sorted { $0.id < $1.id }, outcome: incomplete
             ? .failed(code: .identityUnavailable, message: "Some HID identities are unavailable") : .complete)
     }
 
-    private static func enumerate(_ className: String, body: (io_registry_entry_t) throws -> Void) throws {
+    static func enumerate(_ className: String, body: (io_registry_entry_t) throws -> Void) throws {
         var iterator: io_iterator_t = 0
         guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(className), &iterator) == KERN_SUCCESS else {
             throw DeviceContractError.invalid("registryUnavailable")
         }
+        // A successful search with no matches may have no iterator at all.
+        // Only a non-null iterator can be invalidated during enumeration.
+        guard iterator != 0 else { return }
         defer { IOObjectRelease(iterator) }
         while true {
             let service = IOIteratorNext(iterator)

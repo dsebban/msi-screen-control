@@ -300,7 +300,8 @@ struct DeviceAdapterFailure: Error, Codable, Equatable, Sendable {
     let dispatched: Bool
     let cleanupConfirmed: Bool
     static let codes: Set<String> = ["adapterTimeout", "adapterCancelled", "adapterOutputOverflow", "cleanupFailed", "adapterSignal", "adapterExit",
-        "adapterProtocolMismatch", "hostWorkerBuildMismatch", "hostBuildChanged", "parentLost", "providerChanged", "staleBaseline", "identityMismatch",
+        "adapterProtocolMismatch", "hostWorkerBuildMismatch", "hostBuildChanged", "hostSignatureChanged", "hostUnavailable", "parentLost", "providerChanged", "staleBaseline", "identityMismatch",
+        "unlistedIdentity", "absentEndpoint", "staleEndpoint", "ambiguousEndpoint", "inventoryIncomplete", "registryChanged", "expiredPlan",
         "integrityChangedDuringRun", "unavailableCapability", "unavailableVerification", "deviceAccessDenied", "osExecutionDenied"]
     private enum CodingKeys: String, CodingKey { case code, dispatched, cleanupConfirmed }
     init(code: String, dispatched: Bool, cleanupConfirmed: Bool) { self.code = code; self.dispatched = dispatched; self.cleanupConfirmed = cleanupConfirmed }
@@ -315,7 +316,10 @@ struct DeviceAdapterFailure: Error, Codable, Equatable, Sendable {
 final class DeviceAdapterRunner {
     let registry: SupportRegistry
     let host: AdapterHostIdentity
-    init(registry: SupportRegistry, host: AdapterHostIdentity) { self.registry = registry; self.host = host }
+    private let fixture: DeviceSupportVerificationFixture.Reference?
+    init(registry: SupportRegistry, host: AdapterHostIdentity, fixture: DeviceSupportVerificationFixture.Reference? = nil) {
+        self.registry = registry; self.host = host; self.fixture = fixture
+    }
 
     func invoke(content: SupportPackageContent, payload: AdapterPayload, timeout: TimeInterval,
                 lease: DeviceResourceLock? = nil) async throws -> AdapterResult {
@@ -332,7 +336,7 @@ final class DeviceAdapterRunner {
         try SupportPackageInstaller.validateNative(content, directory: directory)
         guard try SupportPackageContent.read(directory) == content else { throw SupportStorageError.integrityChanged }
         let request = AdapterRequest(providerDigest: content.digest, payload: payload, timeout: timeout)
-        let invocation = HostInvocation(host: host, directory: directory.url.path, supportHome: registry.home.path, request: request, leaseNames: lease?.request.orderedNames ?? [])
+        let invocation = HostInvocation(host: host, directory: directory.url.path, supportHome: registry.home.path, request: request, leaseNames: lease?.request.orderedNames ?? [], fixture: fixture)
         let response: AdapterResponse
         do { response = try await AdapterProcessHost.launch(host: host, invocation: invocation, lease: lease, timeout: timeout) }
         catch {
@@ -342,11 +346,13 @@ final class DeviceAdapterRunner {
             }
             throw error
         }
+        if case .failed(let failure) = response.result { cleanupConfirmed = failure.cleanupConfirmed }
         do {
             guard try SupportPackageContent.read(directory) == content else { throw SupportStorageError.integrityChanged }
             try SupportPackageInstaller.validateNative(content, directory: directory)
-        } catch { throw DeviceAdapterFailure(code: "integrityChangedDuringRun", dispatched: payload.operation == .apply, cleanupConfirmed: true) }
-        try response.validate(request: request)
+        } catch { throw DeviceAdapterFailure(code: "integrityChangedDuringRun", dispatched: payload.operation == .apply, cleanupConfirmed: cleanupConfirmed) }
+        do { try response.validate(request: request) }
+        catch { throw DeviceAdapterFailure(code: "adapterProtocolMismatch", dispatched: payload.operation == .apply, cleanupConfirmed: cleanupConfirmed) }
         if case .apply(_, _, let expected) = payload, case .apply(let evidence) = response.result {
             let descriptor = content.manifest.descriptor
             try evidence.before.validate(descriptor: descriptor, identity: expected.identity)

@@ -66,7 +66,7 @@ public struct KVMCoordinator {
         try registry.validate()
         let machine = try Self.upstream(in: registry, id: upstreamMachineID)
         self.init(registry: registry, upstreamMachine: machine, local: LocalKVMEndpoint(),
-                  remote: machine.map { RemoteKVMEndpoint(host: $0.host!) },
+                  remote: machine.map { RemoteKVMEndpoint(host: $0.host!, transport: $0.sshTransport) },
                   checkRegistry: {
                       guard try registryStore.load() == registry else {
                           throw ScreenError.message("Machine assignments changed since planning; refresh before switching USB")
@@ -96,18 +96,14 @@ public struct KVMCoordinator {
     }
 
     private static func upstream(in registry: MachineRegistry, id: String?) throws -> MachineDefinition? {
-        if let id {
+        if let id = id ?? registry.usbUpstreamMachineID {
             let machine = try registry.machine(id: id)
-            guard machine.platform == .linux, machine.host != nil else {
+            guard machine.isUSBUpstreamCandidate else {
                 throw ScreenError.message("The USB-B machine must be a Linux machine with an SSH host")
             }
             return machine
         }
-        let candidates = registry.machines.filter { $0.platform == .linux }
-        guard candidates.count <= 1 else {
-            throw ScreenError.message("Choose the Linux USB-B machine with --machine ID")
-        }
-        return candidates.first
+        return registry.usbUpstreamMachine
     }
 
     public func status() async throws -> KVMStatus {
@@ -337,6 +333,7 @@ struct LocalKVMEndpoint: KVMEndpoint {
 
 struct RemoteKVMEndpoint: KVMEndpoint {
     let host: String
+    var transport: SSHTransport = .standard
 
     struct Request: Encodable {
         let schemaVersion = 1
@@ -435,19 +432,16 @@ struct RemoteKVMEndpoint: KVMEndpoint {
     }
 
     private func send(_ request: Request, timeout: TimeInterval) async throws -> ProcessRunner.Output {
-        try RemoteMacClient(host: host).validateHost()
+        try RemoteMacClient(host: host, transport: transport).validateHost()
         return try await ProcessRunner.run(
-            executable: URL(fileURLWithPath: "/usr/bin/ssh"),
-            arguments: Self.arguments(host: host), timeout: timeout,
+            executable: try transport.executable(),
+            arguments: try Self.arguments(host: host, transport: transport), timeout: timeout,
             input: JSONEncoder().encode(request), outputLimit: 16_384)
     }
 
-    static func arguments(host: String) -> [String] {
-        ["-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
-         "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=8",
-         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-         "-o", "LogLevel=ERROR", "--", host,
-         #"if [ ! -x "$HOME/.local/share/msi-screen-control/msi-screen-kvm" ]; then printf '%s\n' MSI_SCREEN_KVM_HELPER_MISSING >&2; exit 127; fi; exec "$HOME/.local/share/msi-screen-control/msi-screen-kvm""#]
+    static func arguments(host: String, transport: SSHTransport = .standard) throws -> [String] {
+        try transport.arguments(host: host, command:
+            #"if [ ! -x "$HOME/.local/share/msi-screen-control/msi-screen-kvm" ]; then printf '%s\n' MSI_SCREEN_KVM_HELPER_MISSING >&2; exit 127; fi; exec "$HOME/.local/share/msi-screen-control/msi-screen-kvm""#)
     }
 
     static func decode(_ output: ProcessRunner.Output, action: String) throws -> Response {

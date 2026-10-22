@@ -1,13 +1,26 @@
 import AppKit
 import SwiftUI
 import Combine
+import Darwin
 import MSIScreenCore
+
+/// Verification-only presentation cannot acquire keyboard/main-window status,
+/// including AppKit's automatic launch-time window selection. Production panels
+/// retain their existing key eligibility for normal user interaction.
+@MainActor
+private final class SupportFixturePanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
 
 @MainActor
 final class StatusItemController: NSObject, NSApplicationDelegate {
     let appSettings = AppSettings()
-    private let store = MonitorStore()
-    private let preferences = MonitorPreferences()
+    let store = MonitorStore()
+    let inventory: DeviceInventoryStore
+    let deviceControl: DeviceControlStore
+    private let preferences: MonitorPreferences
+    private let fixture: DeviceSupportVerificationFixture?
     private let updater = AppUpdater()
     private lazy var computers = ComputersStore(preferences: preferences)
     private var statusItem: NSStatusItem?
@@ -25,24 +38,164 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
     private var terminationPending = false
     private var terminationObservation: AnyCancellable?
     private var appControl: RapooAppControlServer?
+    private var fixtureStopObservation: DispatchSourceFileSystemObject?
+    private var fixtureStopRequested = false
+    struct FixtureFrontmost: Encodable, Equatable {
+        let pid: Int32
+        let bundleID: String?
+    }
+    private var fixtureFrontmostBefore: FixtureFrontmost?
+    private var fixtureFrontmostAfter: FixtureFrontmost?
+    private var fixtureInitializationComplete = false
+    private var fixtureInitializationBackgroundSafe = false
+    private var fixtureBackgroundViolation = false
+    private var fixtureHealthHeartbeat: AnyCancellable?
+    private var fixtureSelectedTab: String?
+    private struct FixturePresentationState: Encodable, Equatable {
+        let appIsHidden: Bool
+        let panelWindowNumber: Int?
+        let panelIsVisible: Bool
+        let panelIsMiniaturized: Bool
+        let panelIsOnActiveSpace: Bool
+        let panelOcclusionVisible: Bool
+        let selectedTab: String?
+    }
+    private struct FixturePresentationEvent: Encodable {
+        let sequence: UInt64
+        let checkedAtMilliseconds: UInt64
+        let reason: String
+        let state: FixturePresentationState
+    }
+    private var fixturePresentationEvents: [FixturePresentationEvent] = []
+    private var fixtureLastPresentation: FixturePresentationState?
+    private var fixturePresentationSequence: UInt64 = 0
+
+    private static func fixtureExternalFrontmost(_ sample: FixtureFrontmost?, pid: Int32, bundleID: String?) -> Bool {
+        guard let sample, sample.pid > 0, sample.pid != pid else { return false }
+        return bundleID == nil || sample.bundleID != bundleID
+    }
+
+    static func fixtureForegroundPreservation(before: FixtureFrontmost?, after: FixtureFrontmost?, fixturePID: Int32,
+                                             fixtureBundleID: String?, initializationComplete: Bool, initializationBackgroundSafe: Bool) -> String {
+        // Initialization evidence is about the before/settled-after interval,
+        // not a promise that the user never changes foreground applications later.
+        guard initializationComplete, initializationBackgroundSafe, before == after,
+              fixtureExternalFrontmost(before, pid: fixturePID, bundleID: fixtureBundleID),
+              fixtureExternalFrontmost(after, pid: fixturePID, bundleID: fixtureBundleID) else { return "INCONCLUSIVE" }
+        return "OBSERVED_UNCHANGED"
+    }
+
+    static func fixtureBackgroundSafety(current: FixtureFrontmost?, fixturePID: Int32, fixtureBundleID: String?,
+                                        appIsActive: Bool, panelIsKey: Bool, violation: Bool) -> String {
+        guard !appIsActive, !panelIsKey, !violation,
+              fixtureExternalFrontmost(current, pid: fixturePID, bundleID: fixtureBundleID) else { return "INCONCLUSIVE" }
+        return "PASS"
+    }
+
+    private func fixtureFrontmost() -> FixtureFrontmost? {
+        guard let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier > 0, !app.isTerminated else { return nil }
+        return FixtureFrontmost(pid: app.processIdentifier, bundleID: app.bundleIdentifier)
+    }
+
+    // SwiftUI's delegate adaptor constructs through NSObject's init selector.
+    override convenience init() { self.init(inventory: nil, deviceControl: nil, preferences: nil) }
+
+    init(inventory: DeviceInventoryStore? = nil, deviceControl: DeviceControlStore? = nil, preferences: MonitorPreferences? = nil) {
+        let arguments = CommandLine.arguments
+        let admitted: DeviceSupportVerificationFixture?
+        if arguments.contains("--support-fixture-receipt") || arguments.contains("--support-fixture-nonce") {
+            do {
+                guard arguments.filter({ $0 == "--support-fixture-receipt" }).count == 1,
+                      arguments.filter({ $0 == "--support-fixture-nonce" }).count == 1,
+                      let receipt = arguments.firstIndex(of: "--support-fixture-receipt"), receipt + 1 < arguments.count,
+                      let nonce = arguments.firstIndex(of: "--support-fixture-nonce"), nonce + 1 < arguments.count else { throw DeviceContractError.invalid("invalidFixtureReceipt") }
+                let context = try DeviceSupportVerificationFixture(receiptPath: arguments[receipt + 1], nonce: arguments[nonce + 1])
+                guard Bundle.main.bundleIdentifier == context.bundleIdentifier else { throw DeviceContractError.invalid("fixtureRootMismatch") }
+                admitted = context
+            } catch { NSLog("Isolated support fixture admission refused; no live fallback."); exit(78) }
+        } else { admitted = nil }
+        fixture = admitted
+        if let fixture = admitted {
+            self.inventory = inventory ?? DeviceInventoryStore(services: .fixture(fixture), fixtureLabel: DeviceSupportVerificationFixture.label)
+            self.deviceControl = deviceControl ?? DeviceControlStore(services: .fixture(fixture))
+            self.preferences = preferences ?? MonitorPreferences(defaults: UserDefaults(suiteName: fixture.bundleIdentifier + ".preferences")!, registryStore: MachineRegistryStore(url: fixture.machineRegistryURL))
+        } else {
+            self.inventory = inventory ?? DeviceInventoryStore()
+            self.deviceControl = deviceControl ?? DeviceControlStore()
+            self.preferences = preferences ?? MonitorPreferences()
+        }
+        super.init()
+        configureDeviceOwnership()
+    }
+
+    func configureDeviceOwnership() {
+        appSettings.deviceInventory = inventory
+        if let fixture {
+            appSettings.fixtureSkillInstall = { try fixture.installSkill($0) }
+            appSettings.fixtureSkillAction = { skill in
+                try AgentSkillInstallation(registry: fixture.registry).prospectiveAction(skill: skill,
+                    source: AgentSkillInstallation.bundledSkill(skill), destination: fixture.skillsHome.appendingPathComponent(skill.rawValue))
+            }
+        }
+        store.usbUpstreamMachine = { [weak self] in self?.preferences.usbUpstreamMachine }
+        store.externalMutationActive = { [weak self] in
+            guard let self else { return false }
+            return self.deviceControl.busy || self.inventory.managementBusy || self.inventory.handoffBusy || self.computers.isMutating || self.appSettings.hasActiveOperation
+        }
+        computers.externalMutationActive = { [weak self] in
+            guard let self else { return false }
+            return self.store.hasActiveOperation || self.deviceControl.busy || self.inventory.managementBusy || self.inventory.handoffBusy || self.appSettings.hasActiveOperation
+        }
+        deviceControl.externalMutationActive = { [weak self] in
+            guard let self else { return false }
+            return self.store.hasActiveOperation || self.computers.isMutating || self.inventory.managementBusy || self.inventory.handoffBusy || self.appSettings.hasActiveOperation
+        }
+        inventory.externalMutationActive = { [weak self] in
+            guard let self else { return false }
+            return self.store.hasActiveOperation || self.computers.isMutating || self.deviceControl.busy || self.appSettings.hasActiveOperation
+        }
+        appSettings.externalMutationActive = { [weak self] in
+            guard let self else { return false }
+            return self.store.hasActiveOperation || self.computers.busy || self.deviceControl.busy || self.inventory.managementBusy || self.inventory.handoffBusy
+        }
+        inventory.selectionChanged = { [weak self] in self?.synchronizeDeviceSelection() }
+        inventory.metadataHint = { [weak self] in self?.deviceControl.externalChange() }
+        deviceControl.recheckMetadata = { [weak self] in await self?.inventory.reload() }
+    }
+
+    private func synchronizeDeviceSelection() {
+        if let endpoint = inventory.selectedEndpoint, let binding = inventory.selectedBinding,
+           binding.enabled, let descriptor = inventory.selectedDescriptor {
+            deviceControl.select(.init(endpoint: endpoint, binding: binding, descriptor: descriptor))
+        } else { deviceControl.select(nil) }
+    }
+
+    private var operationChanges: AnyPublisher<Void, Never> {
+        Publishers.MergeMany([store.objectWillChange.eraseToAnyPublisher(), computers.objectWillChange.eraseToAnyPublisher(),
+            appSettings.objectWillChange.eraseToAnyPublisher(), deviceControl.objectWillChange.eraseToAnyPublisher(),
+            inventory.objectWillChange.eraseToAnyPublisher()]).eraseToAnyPublisher()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if fixture != nil { fixtureFrontmostBefore = fixtureFrontmost() }
         NSApp.setActivationPolicy(.accessory)
-        appSettings.configureAtFirstLaunch()
-        updater.willShowModalAlert = { [weak self] in self?.panel?.orderOut(nil) }
-        updater.start()
-        terminationObservation = Publishers.Merge3(store.objectWillChange, computers.objectWillChange, appSettings.objectWillChange)
+        if fixture == nil { inventory.startObservingPassiveChanges() }
+        if fixture == nil { appSettings.configureAtFirstLaunch() }
+        updater.willShowModalAlert = { [weak self] in self?.hideControls(reason: "updater-modal") }
+        if fixture == nil { updater.start() }
+        terminationObservation = operationChanges
             .debounce(for: .milliseconds(40), scheduler: RunLoop.main).sink { [weak self] _ in
                 guard let self, self.terminationPending, !self.hasActiveOperation else { return }
                 self.terminationPending = false
                 NSApp.reply(toApplicationShouldTerminate: true)
             }
-        if UserDefaults.standard.bool(forKey: MonitorStore.appSwitchPreference) {
+        if fixture == nil, UserDefaults.standard.bool(forKey: MonitorStore.appSwitchPreference) {
             try? AppSwitchController.shared.start(mode: store.wheelHostAction)
         }
-        if let bundleID = UserDefaults.standard.string(forKey: MonitorStore.pinnedAppPreference) {
+        if fixture == nil, let bundleID = UserDefaults.standard.string(forKey: MonitorStore.pinnedAppPreference) {
             try? AppSwitchController.shared.pinApplication(bundleIdentifier: bundleID)
         }
+        if fixture == nil {
         do {
             appControl = try RapooAppControlServer()
             changeObservers.append(DistributedNotificationCenter.default().addObserver(
@@ -56,6 +209,7 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         } catch {
             NSLog("MSI Screen CLI bridge unavailable: %@", error.localizedDescription)
         }
+        }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = MonitorAppearance.statusImage(for: nil)
         item.button?.imagePosition = .imageOnly
@@ -67,16 +221,20 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
                                               computers.objectWillChange.eraseToAnyPublisher(),
                                               preferences.objectWillChange.eraseToAnyPublisher())
             .merge(with: updater.objectWillChange.map { _ in () })
+            .merge(with: inventory.objectWillChange.map { _ in () }, deviceControl.objectWillChange.map { _ in () })
             .debounce(for: .milliseconds(40), scheduler: RunLoop.main).sink { [weak self] _ in
                 guard let self else { return }
                 self.updateStatusItem(self.store.state, local: self.computers.local, peer: self.computers.peer)
+                self.publishFixtureHealth()
         }
 
         // A nonactivating panel lets the user keep typing in another app.
         // SwiftUI owns all monitor state; AppKit only owns presentation.
-        let panel = NSPanel(contentRect: NSRect(origin: .zero, size: MonitorAppearance.panelSize),
-                            styleMask: [.titled, .closable, .nonactivatingPanel, .fullSizeContentView],
-                            backing: .buffered, defer: false)
+        let frame = NSRect(origin: .zero, size: MonitorAppearance.panelSize)
+        let mask: NSWindow.StyleMask = [.titled, .closable, .nonactivatingPanel, .fullSizeContentView]
+        let panel: NSPanel
+        if fixture != nil { panel = SupportFixturePanel(contentRect: frame, styleMask: mask, backing: .buffered, defer: false) }
+        else { panel = NSPanel(contentRect: frame, styleMask: mask, backing: .buffered, defer: false) }
         panel.title = "MSI Screen"
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
@@ -95,7 +253,13 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         panel.isOpaque = false
         let hostingView = NSHostingView(rootView: MonitorView(
             store: store, prefs: preferences, computers: computers, updater: updater, appSettings: appSettings,
-            closeControls: { [weak panel] in panel?.orderOut(nil) }
+            inventory: inventory, deviceControl: deviceControl,
+            closeControls: { [weak self] in self?.hideControls(reason: "close-controls-action") },
+            fixtureTabObservation: fixture == nil ? nil : { [weak self] tab, reason in
+                self?.fixtureSelectedTab = tab
+                self?.recordFixturePresentation(reason)
+                self?.publishFixtureHealth()
+            }
         ))
         hostingView.sizingOptions = []
         panel.contentView = hostingView
@@ -103,9 +267,13 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         // reference proportions independent of AppKit's content-rect conversion.
         panel.setFrame(NSRect(origin: panel.frame.origin, size: MonitorAppearance.panelSize), display: false)
         self.panel = panel
-        computers.refresh()
+        if fixture == nil { computers.refresh() }
         refreshTimer = Timer.publish(every: 30, tolerance: 3, on: .main, in: .common).autoconnect().sink { [weak self] _ in
-            guard let self, !self.supervisorStopped, self.panel?.isVisible == false else { return }
+            guard let self, self.fixture == nil, !self.supervisorStopped else { return }
+            if self.panel?.isVisible == true {
+                self.computers.refreshTailnet()
+                return
+            }
             // Read while closed so OSD/CLI changes reach the bar without
             // replacing a draft the user is editing in the open panel.
             self.store.refresh()
@@ -113,28 +281,93 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         changeObservers.append(DistributedNotificationCenter.default().addObserver(
             forName: ScreenController.didChangeNotification, object: nil, queue: .main) { [weak self] notification in
                 guard notification.object as? String != String(ProcessInfo.processInfo.processIdentifier) else { return }
-                Task { @MainActor in self?.store.refreshAfterExternalChange() }
+                Task { @MainActor in if self?.fixture == nil { self?.store.refreshAfterExternalChange() } }
             })
         changeObservers.append(DistributedNotificationCenter.default().addObserver(
             forName: KVMCoordinator.didChangeNotification, object: nil, queue: .main) { [weak self] notification in
                 guard notification.object as? String != String(ProcessInfo.processInfo.processIdentifier) else { return }
-                Task { @MainActor in self?.store.refreshAfterExternalKVMChange() }
+                Task { @MainActor in if self?.fixture == nil { self?.store.refreshAfterExternalKVMChange() } }
             })
         changeObservers.append(DistributedNotificationCenter.default().addObserver(
             forName: MachineRegistryStore.didChangeNotification,
             object: MachineRegistryStore.defaultURL.standardizedFileURL.path, queue: .main) { [weak self] _ in
                 Task { @MainActor in
-                    guard let self else { return }
+                    guard let self, self.fixture == nil else { return }
                     self.preferences.reload()
                     self.computers.refresh()
                 }
             })
+        changeObservers.append(DistributedNotificationCenter.default().addObserver(
+            forName: SupportPackageInstaller.registryDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.inventory.scheduleRefresh() }
+            })
+        changeObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.inventory.scheduleRefresh(stateMayHaveChanged: true) }
+            })
+        changeObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.inventory.scheduleRefresh(stateMayHaveChanged: self.inventory.selectedEndpoint?.kind == .display)
+                }
+            })
+        inventory.refresh()
         observeSupervisor()
-        if openWhenReady || CommandLine.arguments.contains("--show-controls") {
+        observeFixtureStop()
+        if fixture != nil {
+            // Showing a key-eligible panel inside didFinishLaunching allowed
+            // AppKit's remaining launch processing to select it after our old
+            // synchronous snapshot. Show only after that callback has returned.
+            for name in [NSApplication.didBecomeActiveNotification, NSWindow.didBecomeKeyNotification] {
+                changeObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor in
+                        self?.fixtureBackgroundViolation = true
+                        self?.publishFixtureHealth()
+                    }
+                })
+            }
+            // Fixture-only passive diagnostics. These notifications establish
+            // observed transitions, not who caused them; no input monitoring or recovery.
+            for name in [NSApplication.willHideNotification, NSApplication.didHideNotification,
+                         NSApplication.willUnhideNotification, NSApplication.didUnhideNotification] {
+                changeObservers.append(NotificationCenter.default.addObserver(forName: name, object: NSApp, queue: .main) { [weak self] _ in
+                    Task { @MainActor in self?.recordFixturePresentation(name.rawValue); self?.publishFixtureHealth() }
+                })
+            }
+            for name in [NSWindow.willCloseNotification, NSWindow.didMiniaturizeNotification,
+                         NSWindow.didDeminiaturizeNotification, NSWindow.didChangeOcclusionStateNotification] {
+                changeObservers.append(NotificationCenter.default.addObserver(forName: name, object: panel, queue: .main) { [weak self] _ in
+                    Task { @MainActor in self?.recordFixturePresentation(name.rawValue); self?.publishFixtureHealth() }
+                })
+            }
+            changeObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor in self?.recordFixturePresentation("active-space-changed"); self?.publishFixtureHealth() }
+                })
+            // Passive verification heartbeat only: no inventory/adapter/device
+            // operation. Health must not keep reporting a stale foreground sample.
+            fixtureHealthHeartbeat = Timer.publish(every: 1, on: .main, in: .common).autoconnect().sink { [weak self] _ in self?.publishFixtureHealth() }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.fixtureStopRequested else { return }
+                if self.openWhenReady || CommandLine.arguments.contains("--show-controls") { self.showControls() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
+                    guard let self else { return }
+                    self.fixtureFrontmostAfter = self.fixtureFrontmost()
+                    self.fixtureInitializationComplete = NSRunningApplication.current.isFinishedLaunching
+                    self.fixtureInitializationBackgroundSafe = Self.fixtureBackgroundSafety(current: self.fixtureFrontmostAfter,
+                        fixturePID: getpid(), fixtureBundleID: Bundle.main.bundleIdentifier, appIsActive: NSApp.isActive,
+                        panelIsKey: self.panel?.isKeyWindow ?? false, violation: self.fixtureBackgroundViolation) == "PASS"
+                    self.recordFixturePresentation("initialization-settled")
+                    self.publishFixtureHealth()
+                }
+            }
+        } else if openWhenReady || CommandLine.arguments.contains("--show-controls") {
             showControls()
         } else {
             store.refresh()
         }
+        publishFixtureHealth()
         // Cua Driver's window inventory includes only normal-level windows.
         // Give the verifier our exact floating panel ID so all interaction and
         // screenshots still go through Cua rather than a second GUI driver.
@@ -150,6 +383,84 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
                 NSLog("MSI Screen verification window unavailable: %@", error.localizedDescription)
             }
         }
+    }
+
+    private func observeFixtureStop() {
+        guard let fixture else { return }
+        let fd = open(fixture.directory.path, O_EVTONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { NSLog("Fixture lifecycle observation unavailable."); return }
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: .main)
+        source.setEventHandler { [weak self] in self?.acceptFixtureStop() }
+        source.setCancelHandler { close(fd) }
+        fixtureStopObservation = source
+        source.resume()
+        DispatchQueue.main.async { [weak self] in self?.acceptFixtureStop() }
+    }
+
+    private func acceptFixtureStop() {
+        guard let fixture, !fixtureStopRequested else { return }
+        do {
+            if try fixture.terminationRequested() { fixtureStopRequested = true; NSApp.terminate(nil) }
+        }
+        catch { NSLog("Fixture lifecycle request refused.") }
+    }
+
+    private func fixturePresentationState() -> FixturePresentationState {
+        FixturePresentationState(appIsHidden: NSRunningApplication.current.isHidden, panelWindowNumber: panel?.windowNumber,
+            panelIsVisible: panel?.isVisible ?? false, panelIsMiniaturized: panel?.isMiniaturized ?? false,
+            panelIsOnActiveSpace: panel?.isOnActiveSpace ?? false, panelOcclusionVisible: panel?.occlusionState.contains(.visible) ?? false,
+            selectedTab: fixtureSelectedTab)
+    }
+
+    private func recordFixturePresentation(_ reason: String) {
+        guard fixture != nil else { return }
+        let state = fixturePresentationState()
+        fixtureLastPresentation = state
+        fixturePresentationSequence &+= 1
+        fixturePresentationEvents.append(.init(sequence: fixturePresentationSequence,
+            checkedAtMilliseconds: UInt64(Date().timeIntervalSince1970 * 1000), reason: reason, state: state))
+        if fixturePresentationEvents.count > 16 { fixturePresentationEvents.removeFirst(fixturePresentationEvents.count - 16) }
+    }
+
+    private func publishFixtureHealth() {
+        guard let fixture else { return }
+        let active = NSApp.isActive, key = panel?.isKeyWindow ?? false
+        if active || key { fixtureBackgroundViolation = true }
+        let current = fixtureFrontmost()
+        let presentation = fixturePresentationState()
+        if presentation != fixtureLastPresentation { recordFixturePresentation("passive-presentation-change") }
+        struct Health: Encodable {
+            let schema = 1; let label = DeviceSupportVerificationFixture.label
+            let pid: Int32; let bundleID: String?; let nonce: UUID; let selectedID: String?
+            let inventoryGeneration: UInt64; let controlGeneration: UInt64; let metadataRevision: UInt64?; let descriptorCount: Int
+            let busy: Bool; let mutating: Bool; let copyDetail: String
+            let observation: DeviceObservation?; let receipt: DeviceMutationReceipt?; let error: String?
+            let initializationComplete: Bool; let initializationBackgroundSafe: Bool; let appFinishedLaunching: Bool
+            let frontmostBefore: FixtureFrontmost?; let frontmostAfter: FixtureFrontmost?; let frontmostCurrent: FixtureFrontmost?
+            let checkedAtMilliseconds: UInt64; let backgroundViolationObserved: Bool
+            let foregroundPreservation: String; let currentBackgroundSafety: String
+            let appIsActive: Bool; let panelIsKeyWindow: Bool; let panelIsVisible: Bool
+            let appIsHidden: Bool; let panelWindowNumber: Int?; let panelIsMiniaturized: Bool
+            let panelIsOnActiveSpace: Bool; let panelOcclusionVisible: Bool; let selectedTab: String?
+            let presentationEvents: [FixturePresentationEvent]
+        }
+        do {
+            try fixture.writeHealth(StrictJSON.canonical(Health(pid: getpid(), bundleID: Bundle.main.bundleIdentifier, nonce: fixture.reference.nonce,
+                selectedID: inventory.selectedID, inventoryGeneration: inventory.generation, controlGeneration: deviceControl.generation,
+                metadataRevision: inventory.listing?.registry.revision, descriptorCount: inventory.descriptors.count, busy: hasActiveOperation, mutating: deviceControl.isMutating, copyDetail: inventory.copyDetail, observation: deviceControl.observation, receipt: deviceControl.receipt, error: deviceControl.error ?? inventory.error,
+                initializationComplete: fixtureInitializationComplete, initializationBackgroundSafe: fixtureInitializationBackgroundSafe,
+                appFinishedLaunching: NSRunningApplication.current.isFinishedLaunching, frontmostBefore: fixtureFrontmostBefore, frontmostAfter: fixtureFrontmostAfter, frontmostCurrent: current,
+                checkedAtMilliseconds: UInt64(Date().timeIntervalSince1970 * 1000), backgroundViolationObserved: fixtureBackgroundViolation,
+                foregroundPreservation: Self.fixtureForegroundPreservation(before: fixtureFrontmostBefore, after: fixtureFrontmostAfter,
+                    fixturePID: getpid(), fixtureBundleID: Bundle.main.bundleIdentifier, initializationComplete: fixtureInitializationComplete,
+                    initializationBackgroundSafe: fixtureInitializationBackgroundSafe),
+                currentBackgroundSafety: Self.fixtureBackgroundSafety(current: current, fixturePID: getpid(), fixtureBundleID: Bundle.main.bundleIdentifier,
+                    appIsActive: active, panelIsKey: key, violation: fixtureBackgroundViolation),
+                appIsActive: active, panelIsKeyWindow: key, panelIsVisible: presentation.panelIsVisible,
+                appIsHidden: presentation.appIsHidden, panelWindowNumber: presentation.panelWindowNumber, panelIsMiniaturized: presentation.panelIsMiniaturized,
+                panelIsOnActiveSpace: presentation.panelIsOnActiveSpace, panelOcclusionVisible: presentation.panelOcclusionVisible,
+                selectedTab: presentation.selectedTab, presentationEvents: fixturePresentationEvents)))
+        } catch { NSLog("Support fixture health publication failed.") }
     }
 
     private func handleAppControl(id: String, pid: Int32) async {
@@ -196,14 +507,21 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        inventory.stopObservingPassiveChanges()
+        fixtureStopObservation?.cancel()
+        fixtureStopObservation = nil
+        fixtureHealthHeartbeat?.cancel()
+        fixtureHealthHeartbeat = nil
         AppSwitchController.shared.stop()
         for observer in changeObservers {
             DistributedNotificationCenter.default().removeObserver(observer)
+            NotificationCenter.default.removeObserver(observer)
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
     }
 
-    private var hasActiveOperation: Bool {
-        store.busy || computers.busy || store.sideWheelChangeBusy || store.topButtonChangeBusy || appSettings.changingLoginItem
+    var hasActiveOperation: Bool {
+        store.hasActiveOperation || computers.busy || appSettings.hasActiveOperation || deviceControl.busy || inventory.busy || inventory.handoffBusy || inventory.managementBusy
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -213,10 +531,19 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         return .terminateLater
     }
 
+    static func statusItemDescription(title: String, toolTip: String, readyVersion: String?) -> (label: String, toolTip: String) {
+        let label = "MSI Screen controls: \(title)"
+        guard let version = readyVersion else { return (label, toolTip) }
+        return (label + ". Update \(version) ready", toolTip + "\nUpdate \(version) ready to install.")
+    }
+
     private func updateStatusItem(_ state: ScreenState?, local: MacDisplayState?, peer: MacDisplayState?) {
         guard let button = statusItem?.button else { return }
+        let state = inventory.usesBuiltInMonitor ? state : nil
         let title: String
-        if let state {
+        if !inventory.usesBuiltInMonitor {
+            title = inventory.selectedTitle
+        } else if let state {
             switch state.mode {
             case .off:
                 title = state.source1.title
@@ -238,25 +565,28 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
             lastUpdateReady = updateReady
             hasRenderedIcon = true
         }
-        button.setAccessibilityLabel("MSI Screen controls: \(title)")
-        button.toolTip = state == nil
-            ? "Monitor status unavailable. Open controls to refresh."
-            : "Selected layout: \(title). Click to choose full screen or side by side."
-        if let state {
-            let inputs = state.mode == .off ? [state.source1] : [state.source1, state.mode == .pip ? state.pipInput : state.source2]
-            let names = inputs.map { input in
-                let name = preferences.name(for: input, localName: local?.computerName, peerName: peer?.computerName)
-                return "\(input.title): \(name)"
+        if !inventory.usesBuiltInMonitor {
+            let observed = deviceControl.observation.map { Date(timeIntervalSince1970: Double($0.checkedAtMilliseconds) / 1000).description } ?? "not read"
+            button.toolTip = "\(inventory.selectedTitle)\n\(inventory.providerTitle)\nLast explicit observation: \(observed)\(deviceControl.needsRefresh ? " (refresh required)" : "")"
+        } else {
+            button.toolTip = state == nil
+                ? "Monitor status unavailable. Open controls to refresh."
+                : "Selected layout: \(title). Click to choose full screen or side by side."
+            if let state {
+                let inputs = state.mode == .off ? [state.source1] : [state.source1, state.mode == .pip ? state.pipInput : state.source2]
+                let names = inputs.map { input in
+                    let name = preferences.name(for: input, localName: local?.computerName, peerName: peer?.computerName)
+                    return "\(input.title): \(name)"
+                }
+                button.toolTip = names.joined(separator: "\n") + "\nClick to open MSI Screen."
+            } else if let kvm = store.kvm, kvm.controlHost == .upstream {
+                let name = preferences.machines.first { $0.id == kvm.machineID }?.name ?? "the Linux computer"
+                button.toolTip = "USB control is on \(name) via USB-B.\nOpen Machines to return USB to this Mac."
             }
-            button.toolTip = names.joined(separator: "\n") + "\nClick to open MSI Screen."
-        } else if let kvm = store.kvm, kvm.controlHost == .upstream {
-            let name = preferences.machines.first { $0.id == kvm.machineID }?.name ?? "the Linux computer"
-            button.toolTip = "USB control is on \(name) via USB-B.\nOpen Machines to return USB to this Mac."
         }
-        if let version = updater.readyVersion {
-            button.setAccessibilityLabel("MSI Screen controls: \(title). Update \(version) ready")
-            button.toolTip = (button.toolTip ?? "") + "\nUpdate \(version) ready to install."
-        }
+        let description = Self.statusItemDescription(title: title, toolTip: button.toolTip ?? "", readyVersion: updater.readyVersion)
+        button.setAccessibilityLabel(description.label)
+        button.toolTip = description.toolTip
     }
 
     private func observeSupervisor() {
@@ -273,11 +603,10 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         }
         supervisorExit = source
         source.resume()
-        idleObservation = store.$busy.combineLatest(computers.$busy).dropFirst().sink { [weak self] monitorBusy, computersBusy in
-            if !monitorBusy && !computersBusy {
-                // @Published emits before the stored value changes.
-                DispatchQueue.main.async { self?.quitWhenIdle() }
-            }
+        idleObservation = operationChanges.sink { [weak self] _ in
+            // @Published emits before the stored value changes. Use the same
+            // complete predicate as native Quit and Sparkle's relaunch request.
+            DispatchQueue.main.async { self?.quitWhenIdle() }
         }
         if kill(pid, 0) != 0 && errno == ESRCH {
             supervisorStopped = true
@@ -286,12 +615,18 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
     }
 
     private func quitWhenIdle() {
-        if supervisorStopped && !store.busy && !computers.busy { NSApp.terminate(nil) }
+        if supervisorStopped && !hasActiveOperation { NSApp.terminate(nil) }
+    }
+
+    private func hideControls(reason: String) {
+        panel?.orderOut(nil)
+        recordFixturePresentation(reason)
+        publishFixtureHealth()
     }
 
     @objc private func toggleControls() {
         guard let panel else { return }
-        if panel.isVisible { panel.orderOut(nil) } else { showControls() }
+        if panel.isVisible { hideControls(reason: "status-item-toggle-hide") } else { showControls() }
     }
 
     private func showControls() {
@@ -304,10 +639,14 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         } else {
             panel.center()
         }
-        // orderFront does not reliably raise an inactive accessory app's
-        // panel. Raise it explicitly without activating or taking key focus.
+        // Order without an explicit activation call. This alone is not proof
+        // of background safety: the fixture separately refuses key/main status
+        // and reports actual settled/current app/window observations.
         panel.orderFrontRegardless()
+        recordFixturePresentation("show-controls")
         appSettings.refresh()
+        inventory.refresh()
+        guard fixture == nil else { publishFixtureHealth(); return }
         preferences.reload()
         computers.refreshIfStale()
         if store.showingSettings { store.refreshSettings() }

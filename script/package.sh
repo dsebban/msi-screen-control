@@ -82,7 +82,36 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/MSIScreenMenu" "$APP/Contents/MacOS/MSIScreenMenu"
 cp "$BIN_DIR/msi-screen" "$APP/Contents/MacOS/msi-screen"
 cp "$ROOT_DIR/LICENSE" "$APP/Contents/Resources/LICENSE"
-/usr/bin/ditto "$ROOT_DIR/skills/msi-screen-control" "$APP/Contents/Resources/AgentSkills/msi-screen-control"
+for SKILL in msi-screen-control write-addhoc-support; do
+    /usr/bin/ditto "$ROOT_DIR/skills/$SKILL" "$APP/Contents/Resources/AgentSkills/$SKILL"
+done
+# ditto merges: fail on stale extras rather than sign a subtly different skill.
+# Do not delete unfamiliar content from an existing output bundle to make it pass.
+python3 - "$ROOT_DIR/skills" "$APP/Contents/Resources/AgentSkills" <<'PY'
+from pathlib import Path
+import sys
+source, bundled = map(Path, sys.argv[1:])
+names = {'msi-screen-control', 'write-addhoc-support'}
+required = {
+    'msi-screen-control': {'SKILL.md', 'agents/openai.yaml', 'references/advanced-controls.md'},
+    'write-addhoc-support': {'SKILL.md', 'agents/openai.yaml', 'references/contract-v1.md', 'references/validation.md'},
+}
+def tree(root):
+    result = {}
+    if root.is_symlink() or not root.is_dir():
+        raise SystemExit('Unsafe or missing skill resource: ' + str(root))
+    for p in root.rglob('*'):
+        if p.is_symlink() or not (p.is_file() or p.is_dir()):
+            raise SystemExit('Unsafe skill resource: ' + str(p))
+        result[str(p.relative_to(root)) + ('/' if p.is_dir() else '')] = None if p.is_dir() else p.read_bytes()
+    return result
+if {p.name for p in bundled.iterdir()} != names:
+    raise SystemExit('Bundled skill catalog differs from the two named skills')
+for name in sorted(names):
+    expected = tree(source / name)
+    if {p for p in expected if not p.endswith('/')} != required[name] or tree(bundled / name) != expected:
+        raise SystemExit('Bundled skill has missing, changed or stale extra resources: ' + name)
+PY
 mkdir -p "$APP/Contents/Frameworks"
 SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
 /usr/bin/ditto "$BIN_DIR/Sparkle.framework" "$SPARKLE"

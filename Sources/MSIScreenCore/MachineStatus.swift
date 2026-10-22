@@ -49,10 +49,15 @@ public struct MachineStatusClient {
     public func state(for machine: MachineDefinition) async -> MachineStatus {
         do {
             try MachineRegistry(machines: [machine]).validate()
+            if machine.access == .videoOnly {
+                return MachineStatus(machineID: machine.id, name: machine.name, platform: machine.platform,
+                                     checkedAt: Date(), reachable: nil, user: nil, architecture: nil,
+                                     macDisplays: nil, connectors: [], error: nil)
+            }
             if machine.platform == .macos {
                 let displays: MacDisplayState
                 if let host = machine.host {
-                    displays = try await RemoteMacClient(host: host).state()
+                    displays = try await RemoteMacClient(host: host, transport: machine.sshTransport).state()
                 } else {
                     displays = try MacDisplayController().state()
                 }
@@ -60,8 +65,9 @@ public struct MachineStatusClient {
             }
             guard let host = machine.host else { throw ScreenError.message("A Linux machine needs an SSH host") }
             let output = try await ProcessRunner.run(
-                executable: URL(fileURLWithPath: "/usr/bin/ssh"),
-                arguments: Self.linuxArguments(host: host), timeout: 25, outputLimit: 65_536
+                executable: try machine.sshTransport.executable(),
+                arguments: try Self.linuxArguments(host: host, transport: machine.sshTransport),
+                timeout: 25, outputLimit: 65_536
             )
             guard output.succeeded, !output.truncated else {
                 throw ScreenError.message(output.timedOut ? "SSH status check timed out" :
@@ -82,11 +88,8 @@ public struct MachineStatusClient {
         }
     }
 
-    static func linuxArguments(host: String) -> [String] {
-        ["-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
-         "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=8",
-         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-         "-o", "LogLevel=ERROR", "--", host, linuxCommand]
+    static func linuxArguments(host: String, transport: SSHTransport = .standard) throws -> [String] {
+        try transport.arguments(host: host, command: linuxCommand)
     }
 
     // No installation, environment edits or video changes. uname is available

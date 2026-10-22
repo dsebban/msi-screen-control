@@ -91,20 +91,37 @@ final class DeviceResourceLock {
     /// exact raw physical/ancestry leases. This is exclusion, not an inferred
     /// device association or permission to query any other controller/receiver.
     static func controlRequest(_ endpoint: DeviceEndpoint, graph: USBDeviceGraph, descriptor: DeviceDescriptor) throws -> Request {
-        let selected = try selectedRequest(endpoint, graph: graph)
+        try controlRequest(endpoint, usbGraph: { graph }, descriptor: descriptor)
+    }
+    static func controlRequest(_ endpoint: DeviceEndpoint, usbGraph: () throws -> USBDeviceGraph, descriptor: DeviceDescriptor) throws -> Request {
+        let selected = try selectedRequest(endpoint, usbGraph: usbGraph)
         let routing = descriptor.capabilities.contains { cap in
             if case .usbRoute = cap.definition { return cap.access == .readWrite }; return false
         }
-        return Request(domains: selected.domains, controller: selected.controller || routing, rapoo: selected.rapoo || routing)
+        return Request(domains: selected.domains + configurationRequest(endpoint).domains,
+            controller: selected.controller || routing, rapoo: selected.rapoo || routing)
+    }
+    /// Installation-scoped configuration identity survives durable reattachment.
+    /// It supplements, never replaces, globally shared raw/ancestry exclusion.
+    static func configurationRequest(_ endpoint: DeviceEndpoint) -> Request {
+        Request(domains: ["configuration:" + endpoint.physicalDomainID])
     }
     static func selectedRequest(_ endpoint: DeviceEndpoint, graph: USBDeviceGraph) throws -> Request {
+        try selectedRequest(endpoint, usbGraph: { graph })
+    }
+    /// Only USB-backed selections depend on complete USB ancestry. A failed
+    /// unrelated USB source must not invalidate an exact non-USB HID endpoint.
+    static func selectedRequest(_ endpoint: DeviceEndpoint, usbGraph: () throws -> USBDeviceGraph) throws -> Request {
         let usbID: UInt64
         switch endpoint.address {
         case .usb(let id, _), .hid(_, let id?, _): usbID = id
-        case .hid(let id, nil, _): return Request(domains: ["hid:\(id)"])
-        case .providerObservedPaired(let receiver, _, _): return try request(usbID: receiver, graph: graph)
+        case .hid(let id, nil, _):
+            if endpoint.identity.transport == .usb { _ = try usbGraph() }
+            return Request(domains: ["hid:\(id)"])
+        case .providerObservedPaired(let receiver, _, _): return try request(usbID: receiver, graph: usbGraph())
         default: return Request(domains: ["endpoint:" + endpoint.physicalDomainID])
         }
+        let graph = try usbGraph()
         guard let node = graph.devices.first(where: { $0.id == usbID }) else { throw DeviceContractError.invalid("absentEndpoint") }
         guard node.vendor.flatMap(UInt32.init(exactly:)) == endpoint.identity.vendorID,
               node.product.flatMap(UInt32.init(exactly:)) == endpoint.identity.productID else { throw DeviceContractError.invalid("staleEndpoint") }

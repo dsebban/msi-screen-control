@@ -29,6 +29,14 @@ final class DeviceInventoryTests: XCTestCase {
     func endpoint(_ snapshot: DeviceInventorySnapshot, kind: DeviceEndpointKind) throws -> DeviceEndpoint {
         try XCTUnwrap(snapshot.devices.flatMap(\.endpoints).first { $0.kind == kind })
     }
+    func testEmptyRegistryMatchIsNotReportedAsAChangedRegistry() throws {
+        // IOKit can return success with a null iterator when there are no
+        // matches. This is absence, not an invalidated in-progress enumeration.
+        XCTAssertNoThrow(try USBDeviceGraph.enumerate("MSIScreenControlAbsentRegressionService") { _ in
+            XCTFail("The regression fixture must not match a registry service")
+        })
+    }
+
     func testNoMSIAndIndependentFailedSourcesStillInventory() async throws {
         let reader = MacDeviceInventoryReader(identity: try identity(), bootIdentity: "boot", sources: DeviceInventorySources(
             displays: { InventorySourceSlice([self.display()]) },
