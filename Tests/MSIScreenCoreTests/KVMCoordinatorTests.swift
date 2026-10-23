@@ -114,6 +114,51 @@ final class KVMCoordinatorTests: XCTestCase {
         XCTAssertEqual(local.writes + remote.writes, 0)
     }
 
+    func testConnectionSnapshotKeepsLocalFailureAndDoesNotProbeAnotherUSBHost() async {
+        let local = Endpoint([]); local.readError = ScreenError.message("busy")
+        let remote = Endpoint([.upstream])
+        let result = await coordinator(local, remote).inspectConnection()
+        XCTAssertEqual(result.local.state, .unavailable)
+        XCTAssertEqual(result.local.error, "busy")
+        XCTAssertEqual(result.upstream.state, .notChecked)
+        XCTAssertEqual(remote.reads, 0)
+        XCTAssertNil(result.usb)
+        XCTAssertEqual(local.writes + remote.writes, 0)
+    }
+
+    func testConnectionSnapshotDistinguishesLocalAbsenceFromUpstreamFailure() async {
+        let local = Endpoint([nil]), remote = Endpoint([])
+        remote.readError = ScreenError.message("SSH unavailable")
+        let result = await coordinator(local, remote).inspectConnection()
+        XCTAssertEqual(result.local.state, .absent)
+        XCTAssertEqual(result.upstream.state, .unavailable)
+        XCTAssertEqual(result.upstreamMachineID, linux.id)
+        XCTAssertNil(result.layout)
+        XCTAssertNil(result.usb)
+        XCTAssertEqual(local.writes + remote.writes, 0)
+    }
+
+    func testConnectionSnapshotPreservesUSBReadbackWhenLayoutCannotBeRead() async {
+        let local = Endpoint([.usbc]), remote = Endpoint([])
+        let result = await coordinator(local, remote).inspectConnection()
+        XCTAssertEqual(result.local.state, .available)
+        XCTAssertEqual(result.usb?.route, .usbc)
+        XCTAssertNil(result.layout)
+        XCTAssertNotNil(result.layoutError)
+        XCTAssertEqual(remote.reads, 0)
+        XCTAssertEqual(local.writes + remote.writes, 0)
+    }
+
+    func testSSHConnectionFailureIsNotReportedAsMalformedCompanionJSON() {
+        let output = ProcessRunner.Output(text: "ssh: connect to host fixture port 22: Operation timed out\n",
+                                          exitCode: 255, timedOut: false, truncated: false)
+        XCTAssertThrowsError(try RemoteKVMEndpoint.decode(output, action: "status")) {
+            XCTAssertTrue($0.localizedDescription.contains("SSH request failed"))
+            XCTAssertTrue($0.localizedDescription.contains("Operation timed out"))
+            XCTAssertFalse($0.localizedDescription.contains("invalid USB response"))
+        }
+    }
+
     func testStaleRouteAndRegistryChangeRejectBeforeWrite() async {
         let local = Endpoint([.usbc])
         let remote = Endpoint([])

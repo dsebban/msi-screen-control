@@ -84,6 +84,8 @@ final class MachineTests: XCTestCase {
                                             input: .dp, host: nil, access: .videoOnly)
             let status = await MachineStatusClient().state(for: machine)
             XCTAssertEqual(status.name, machine.name)
+            XCTAssertEqual(status.configuredName, machine.name)
+            XCTAssertNil(status.observedName)
             XCTAssertEqual(status.platform, platform)
             XCTAssertNil(status.reachable)
             XCTAssertNil(status.user)
@@ -91,6 +93,25 @@ final class MachineTests: XCTestCase {
             XCTAssertTrue(status.connectors.isEmpty)
             XCTAssertNil(status.error)
         }
+    }
+
+    func testObservedMacNamePreservesItsConfiguredAliasSeparately() {
+        let displays = MacDisplayState(computerName: "Observed Mac name", displays: [])
+        let status = MachineStatus(machine: local, macDisplays: displays)
+        XCTAssertEqual(status.configuredName, "This Mac")
+        XCTAssertEqual(status.observedName, "Observed Mac name")
+        XCTAssertEqual(status.name, status.observedName)
+    }
+
+    func testFailedIdentityCheckDoesNotObserveItsConfiguredName() async {
+        var invalid = local
+        invalid.platform = .linux // Reject before any local display or SSH work.
+        let status = await MachineStatusClient().state(for: invalid)
+        XCTAssertEqual(status.name, invalid.name)
+        XCTAssertEqual(status.configuredName, invalid.name)
+        XCTAssertNil(status.observedName)
+        XCTAssertNil(status.reachable)
+        XCTAssertNotNil(status.error)
     }
 
     func testUSBUpstreamMigrationPreservesOnlyUnambiguousLegacyAssignment() throws {
@@ -213,7 +234,77 @@ final class MachineTests: XCTestCase {
         XCTAssertEqual(identity.connectors[0].status, .connected)
         XCTAssertEqual(identity.connectors[0].modes, ["1720x1440", "2560x1440"])
         XCTAssertEqual(identity.connectors[1].status, .disconnected)
+        XCTAssertTrue(identity.connectors.allSatisfy { $0.identification == nil && $0.identificationError == nil },
+                      "Older probe responses do not establish a display identity")
         XCTAssertThrowsError(try MachineStatusClient.decodeLinux(output.replacingOccurrences(of: "HOSTNAME\tlinux-fixture\n", with: "")))
         XCTAssertThrowsError(try MachineStatusClient.decodeLinux(output + "\nCONNECTOR\tcard0-DP-1\tdisconnected"))
+    }
+
+    func testLinuxEDIDIdentifiesTheDisplayIndependentlyOfItsHostConnectorNumber() throws {
+        let response = linuxIdentity + "\nCONNECTOR\tcard0-HDMI-A-3\tconnected\nEDID\tcard0-HDMI-A-3\t" + syntheticEDID().hex
+        let result = try MachineStatusClient.decodeLinux(response)
+        let connector = try XCTUnwrap(result.connectors.first)
+        let identification = try XCTUnwrap(connector.identification)
+        XCTAssertEqual(connector.id, "card0-HDMI-A-3")
+        XCTAssertEqual(identification.vendorID, 0x3669)
+        XCTAssertEqual(identification.productID, 0x30c5)
+        XCTAssertEqual(identification.name, "Fixture MSI")
+        XCTAssertEqual(identification.hdmiPhysicalAddress?.dottedString, "2.0.0.0")
+        XCTAssertNil(connector.identificationError)
+    }
+
+    func testLinuxEDIDFailurePreservesObservedHostAndConnectorFacts() throws {
+        var invalid = syntheticEDID()
+        invalid[20] ^= 1
+        let response = linuxIdentity + "\nCONNECTOR\tcard0-DP-1\tconnected\nEDID\tcard0-DP-1\t" + invalid.hex
+        let result = try MachineStatusClient.decodeLinux(response)
+        XCTAssertEqual(result.name, "observed-linux")
+        XCTAssertEqual(result.connectors.first?.status, .connected)
+        XCTAssertNil(result.connectors.first?.identification)
+        XCTAssertEqual(result.connectors.first?.identificationError, "invalidChecksum")
+
+        let unavailable = try MachineStatusClient.decodeLinux(linuxIdentity + "\nCONNECTOR\tcard0-DP-1\tconnected\nEDID_ERROR\tcard0-DP-1\tunreadable")
+        XCTAssertEqual(unavailable.name, "observed-linux")
+        XCTAssertNil(unavailable.connectors.first?.identification)
+        XCTAssertEqual(unavailable.connectors.first?.identificationError, "unreadable")
+    }
+
+    func testLinuxEDIDRowsRejectMalformedDuplicateAndUnmatchedEvidence() {
+        let baseline = linuxIdentity + "\nCONNECTOR\tcard0-DP-1\tconnected\n"
+        let valid = "EDID\tcard0-DP-1\t" + syntheticEDID().hex
+        let badRows = [
+            "EDID\tcard0-DP-1\t", "EDID\tcard0-DP-1\t0", "EDID\tcard0-DP-1\txx",
+            "EDID\tcard0-DP-1\t" + String(repeating: "00", count: 4097),
+            "EDID\tunknown-connector\t" + syntheticEDID().hex,
+            valid + "\n" + valid,
+            valid + "\nEDID_ERROR\tcard0-DP-1\tempty",
+            "EDID_ERROR\tcard0-DP-1\tempty\nEDID_ERROR\tcard0-DP-1\tunreadable",
+            "EDID_ERROR\tcard0-DP-1\tunrecognized-private-text"
+        ]
+        for rows in badRows {
+            XCTAssertThrowsError(try MachineStatusClient.decodeLinux(baseline + rows))
+        }
+        let disconnected = linuxIdentity + "\nCONNECTOR\tcard0-DP-1\tdisconnected\n" + valid
+        XCTAssertThrowsError(try MachineStatusClient.decodeLinux(disconnected),
+                             "A disconnected output cannot publish a current EDID identity")
+    }
+
+    private var linuxIdentity: String {
+        "USER\tfixture\nHOSTNAME\tobserved-linux\nKERNEL\tLinux\nARCH\tx86_64"
+    }
+
+    /// Synthetic public identity and topology, with no real monitor serial.
+    private func syntheticEDID() -> [UInt8] {
+        var base = [UInt8](repeating: 0, count: 128)
+        base.replaceSubrange(0..<12, with: [0, 255, 255, 255, 255, 255, 255, 0, 0x36, 0x69, 0xc5, 0x30])
+        base[18] = 1; base[19] = 4; base[20] = 0x80; base[126] = 1
+        base[57] = 0xfc
+        base.replaceSubrange(59..<71, with: Array("Fixture MSI\n".utf8))
+        var cta = [UInt8](repeating: 0, count: 128)
+        cta[0] = 2; cta[1] = 3; cta[2] = 10
+        cta.replaceSubrange(4..<10, with: [0x65, 0x03, 0x0c, 0x00, 0x20, 0x00])
+        base[127] = UInt8((256 - base.reduce(0, { $0 + Int($1) }) % 256) % 256)
+        cta[127] = UInt8((256 - cta.reduce(0, { $0 + Int($1) }) % 256) % 256)
+        return base + cta
     }
 }

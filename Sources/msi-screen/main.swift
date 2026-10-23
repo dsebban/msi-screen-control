@@ -12,6 +12,8 @@ func emit<T: Encodable>(_ object: T) throws {
 let help = """
 msi-screen status
 msi-screen identity
+msi-screen connections
+msi-screen video
 msi-screen pbp on [--left hdmi1|hdmi2|dp|usbc] [--right hdmi1|hdmi2|dp|usbc] [--preserve-usb] [--dry-run]
 msi-screen pbp off [--preserve-usb] [--dry-run]
 msi-screen input hdmi1|hdmi2|dp|usbc [--preserve-usb] [--dry-run]
@@ -56,6 +58,9 @@ Repeating the same desired configuration performs no further writes.
 Only MSI MD342CQP / protocol V20 is supported. Firmware is never flashed.
 identity reads two model/firmware identifiers without reading or changing model-specific settings.
 It reports unmatched identities for compatibility research; shared USB IDs do not imply support.
+connections reads local video, connector evidence, USB control and configured computers independently.
+Observed computer names and inferred HDMI topology are separate from saved names/input assignments.
+It changes no assignments, video mode or USB route; unavailable sources remain explicit in the snapshot.
 fullscreen exits PBP/PIP and selects the input in one verified operation.
 --preserve-usb reads the current USB owner's layout and preserves its USB route after a picture change.
 It may temporarily acquire USB-C, then return USB after verified video readback; failures report completed stages.
@@ -156,7 +161,7 @@ do {
             let model = "MD342CQP"
             let protocolVersion = "V20"
             let inputs = Input.allCases
-            let commands = ["status", "identity", "pbp on [--left INPUT] [--right INPUT]", "pbp off", "input INPUT", "fullscreen INPUT",
+            let commands = ["status", "identity", "connections", "video", "pbp on [--left INPUT] [--right INPUT]", "pbp off", "input INPUT", "fullscreen INPUT",
                             "displays", "permissions", "main monitor|built-in", "arrange left|right", "machine arrange ID left|right", "display-request", "settings", "kvm status [--machine ID]", "kvm layout [--machine ID]", "kvm set ROUTE --expected ROUTE [--machine ID]", "peripherals [--machine ID]",
                             "peripherals describe", "peripherals mouse", "peripherals mouse-map PRESET --expected-left HEX --expected-right HEX",
                             "peripherals controllers", "peripherals controller-test [--seconds 1..15]",
@@ -189,6 +194,21 @@ do {
     if args == ["identity"], !dryRun {
         try emit(ScreenController.withHIDConnection { try $0.identity() })
         exit(0)
+    }
+    if args.first == "video" {
+        guard args == ["video"], !dryRun else { throw ScreenError.message("Use video without extra arguments") }
+        let snapshot = VideoDiagnosticsClient().snapshot()
+        try emit(snapshot)
+        exit(snapshot.complete ? 0 : 1)
+    }
+    if args.first == "connections" {
+        guard args == ["connections"], !dryRun else {
+            throw ScreenError.message("Use connections without extra arguments")
+        }
+        let registry = Swift.Result { try machineRegistryStore().load() }
+        let snapshot = await MonitorConnectionClient().snapshot(registry: registry)
+        try emit(snapshot)
+        exit(snapshot.complete ? 0 : 1)
     }
     if args.first == "machine" {
         guard args.count >= 2 else { throw ScreenError.message("Invalid machine command. Run msi-screen --help") }

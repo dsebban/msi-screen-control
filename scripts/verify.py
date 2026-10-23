@@ -24,6 +24,8 @@ from cua_session import CuaSession
 
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--connections', action='store_true', help='Read independent video, USB and machine evidence, including useful partial results when USB or a remote computer is unavailable; no mutations or GUI')
+parser.add_argument('--video', action='store_true', help='Read local video modes and port diagnostics without USB/SSH; add --gui to exercise opt-in monitoring and its stop control')
 parser.add_argument('--agent-skill-fixture', type=Path, help='With --gui, use an isolated app copy to install its agent skill into this user\'s ~/.agents/skills, then verify the real installed files; leave the requested skill installed')
 parser.add_argument('--login-item', action='store_true', help='With --gui, toggle launch at login in the installed app and restore its baseline; verify macOS registration independently')
 parser.add_argument('--update-fixture', type=Path, help='With --gui, use this release app to verify a real signed Sparkle download in isolated app copies')
@@ -63,6 +65,12 @@ parser.add_argument('--binary', type=Path, default=root / '.build/debug/msi-scre
 parser.add_argument('--app', type=Path, help='Packaged app to validate offline or require for a GUI launch')
 parser.add_argument('--dmg', type=Path, help='With --offline, mount a signed/notarized universal DMG read-only and verify its app, CLI and install shortcut')
 args = parser.parse_args()
+if args.video and any(value for name, value in vars(args).items()
+                     if name not in ('video', 'binary', 'gui', 'app')):
+    parser.error('--video is a separate read-only check; only --binary, --gui and --app may be added')
+if args.connections and any(value for name, value in vars(args).items()
+                            if name not in ('connections', 'binary')):
+    parser.error('--connections is a separate read-only backend check; only --binary may be added')
 if (args.support_fixture_action or args.support_fixture_root) and not args.support_fixture:
     parser.error('fixture action/root requires --support-fixture')
 if args.support_fixture and any((args.offline, args.dmg, args.previous_app, args.agent_skill_fixture, args.login_item,
@@ -646,6 +654,12 @@ def offline():
         if 'identity' in capability['commands']:
             run('identity', '--dry-run', success=False)
             run('identity', '--unknown', success=False)
+        if 'connections' in capability['commands']:
+            run('connections', '--dry-run', success=False)
+            run('connections', '--unknown', success=False)
+        if 'video' in capability['commands']:
+            run('video', '--dry-run', success=False)
+            run('video', '--unknown', success=False)
         assert capability['schemaVersion'] == 1
         assert capability['model'] == 'MD342CQP' and capability['protocolVersion'] == 'V20'
         assert set(capability['inputs']) == {'hdmi1', 'hdmi2', 'dp', 'usbc'}
@@ -1143,13 +1157,54 @@ def support_fixture():
                      'ownedAppStopped': process.poll() is not None, 'clipboardTouchedByVerifier': False})
 
 
+def verify_connections():
+    summary = {'stage': 'connections', 'passed': False, 'mutationsRequested': False}
+    try:
+        capabilities = run('capabilities')
+        assert 'connections' in capabilities['commands'], 'CLI does not advertise connection evidence'
+        registry = run('machine', 'list')
+        displays = run('displays')
+        event = run('connections', success=None, return_event=True, timeout=90)
+        snapshot = event['result']
+        assert snapshot['schemaVersion'] == 1
+        assert event['exitCode'] == (0 if snapshot['complete'] else 1), 'Partial observations lost their failure exit code'
+        local = snapshot['localVideo']
+        expected = {display['uuid'] for display in displays['displays']
+                    if display['vendor'] == 0x3669 and display['model'] == 0x30c5 and not display['isBuiltIn']}
+        observed = {connection['display']['uuid'] for connection in local['displays']}
+        assert observed == expected, 'Aggregate video differs from independent CoreGraphics display read'
+        assert local.get('computerName') == displays['computerName'], 'Local name did not come from macOS'
+        assert local['state'] == ('notDetected' if not expected else 'detected' if len(expected) == 1 else 'ambiguous')
+        definitions = {machine['id']: machine for machine in registry['machines']}
+        assert {machine['machineID'] for machine in snapshot['machines']} == set(definitions)
+        for machine in snapshot['machines']:
+            definition = definitions[machine['machineID']]
+            assert machine.get('configuredInput') == definition.get('input')
+            assert machine['configuredName'] == definition['name']
+            if machine.get('error'):
+                assert machine['video'] == 'unknown', 'Failed remote read fabricated a video observation'
+        assert run('machine', 'list') == registry, 'Connection discovery changed saved assignments'
+        summary.update(passed=True, observationComplete=snapshot['complete'],
+                       localVideo=local, usbControl=snapshot['usbControl'], machines=snapshot['machines'])
+    except Exception as error:
+        summary['error'] = str(error)
+        raise
+    finally:
+        (output / 'summary.json').write_text(json.dumps(summary, indent=2))
+        print(json.dumps(summary), flush=True)
+        print('Evidence:', output, flush=True)
+    return 0
+
+
+if args.connections:
+    sys.exit(verify_connections())
 if args.support_fixture:
     sys.exit(support_fixture())
 if args.offline:
     sys.exit(offline())
 
 
-summary = {'exercise': args.exercise, 'exerciseControls': args.exercise_controls,
+summary = {'exercise': args.exercise, 'exerciseControls': args.exercise_controls, 'video': args.video,
            'exercisePeerControls': args.exercise_peer_controls,
            'exerciseMachine': args.exercise_machine, 'exerciseMachineEditor': args.exercise_machine_editor,
            'exerciseFocus': args.exercise_focus, 'peripherals': args.peripherals, 'probePointer': args.probe_pointer, 'probeController': args.probe_controller,
@@ -1291,8 +1346,8 @@ def gui_inspect_agent_skill():
     for label in ('installed', 'repeated'):
         gui_click('Install agent skill', 'AXButton')
         gui_wait_for('gui-agent-skill-' + label, lambda tree:
-                     'Available on your next agent turn.' in tree,
-                     failed=('A different skill already exists', 'The agent skill is missing'))
+                     'Available on your next agent turn' in tree,
+                     failed=('Missing, conflicting, linked or incompatible skill', 'The agent skill is missing'))
         gui_snapshot('gui-agent-skill-' + label, screenshot=True)
         expected = {str(p.relative_to(source)): p.read_bytes() for p in source.rglob('*') if p.is_file()}
         actual = {str(p.relative_to(destination)): p.read_bytes() for p in destination.rglob('*') if p.is_file()}
@@ -3483,6 +3538,50 @@ def exercise_brightness():
         assert summary['brightnessRestored'], 'Final monitor settings differ from the baseline'
 
 
+def inspect_video():
+    capability = run('capabilities')
+    assert 'video' in capability['commands'], 'Video diagnostics are unavailable in this executable'
+    before = run('displays')
+    event = run('video', success=None, return_event=True)
+    snapshot = event['result']
+    assert event['exitCode'] == (0 if snapshot['complete'] else 1)
+    assert snapshot['complete'], 'Local video observation is incomplete; retain the actual CLI evidence'
+    expected = {d['uuid'] for d in before['displays'] if d['vendor'] == 0x3669 and d['model'] == 0x30c5}
+    assert {d['display']['uuid'] for d in snapshot['displays']} == expected
+    for item in snapshot['displays']:
+        assert item['modes'], 'Missing OS mode choices'
+        for mode in item['modes']:
+            assert mode['width'] > 0 and mode['height'] > 0 and mode['refreshRate'] >= 0
+    result = {'snapshot': snapshot, 'guiExercised': False, 'physicalSignalQualityMeasured': False}
+    if args.gui:
+        gui_click('Connection', 'AXButton')
+        paused = gui_wait_for('gui-video-paused', lambda tree: 'Connection & refresh rates' in tree
+                             and 'Start monitoring' in tree and 'Last read' in tree)
+        if expected:
+            assert 'Available at this resolution' in paused['tree_markdown']
+            gui_expand('All available modes')
+            gui_snapshot('gui-video-all-modes', screenshot=True)
+            gui_expand('All available modes', expanded=False)
+        gui_click('Start monitoring', 'AXButton')
+        gui_wait_for('gui-video-observing', lambda tree: 'Stop monitoring' in tree and re.search(r'\d+ changes since', tree))
+        time.sleep(2.5)  # Observe the actual periodic path, then prove Stop cancels it.
+        observing = gui_snapshot('gui-video-observing-sample', screenshot=True)
+        assert 'Stop monitoring' in observing['tree_markdown']
+        gui_click('Stop monitoring', 'AXButton')
+        stopped = gui_wait_for('gui-video-stopped', lambda tree: 'Start monitoring' in tree and 'Paused' in tree)
+        def last_read(state):
+            # Cua's actionable element list omits noninteractive static text.
+            return re.findall(r'AXStaticText = "(Last read [^"]+)"', state.get('tree_markdown', ''))
+        stopped_time = last_read(stopped)
+        assert stopped_time, 'Last-read time is not observable'
+        time.sleep(2.5)
+        after_stop = gui_snapshot('gui-video-remains-stopped', screenshot=True)
+        assert last_read(after_stop) == stopped_time, 'Video sampling continued after Stop'
+        result.update(guiExercised=True, monitoringStartedAndStopped=True, stoppedSamplingVerified=True)
+    assert run('displays') == before, 'Video configuration changed during read-only diagnostics; no restoration attempted'
+    summary['videoDiagnostics'] = result
+
+
 try:
     update_server = None
     update_bundle_id = 'com.danielsivan.msi-screen.menu'
@@ -3490,7 +3589,9 @@ try:
         update_server, update_bundle_id = prepare_update_fixture(args.update_fixture.resolve())
     if args.agent_skill_fixture:
         update_bundle_id = prepare_agent_skill_fixture(args.agent_skill_fixture.resolve())
-    if args.peripherals or args.permissions or args.menu_appearance or args.update_fixture or args.login_item or args.agent_skill_fixture:
+    if args.video:
+        pass  # Local video diagnostics must work independently of saved machines.
+    elif args.peripherals or args.permissions or args.menu_appearance or args.update_fixture or args.login_item or args.agent_skill_fixture:
         registry_baseline = run('machine', 'list')
         summary['machines'] = registry_baseline
     else:
@@ -3569,14 +3670,14 @@ try:
             expected_executable = args.app.resolve() / 'Contents/MacOS/MSIScreenMenu'
             assert Path(executable).resolve() == expected_executable.resolve(), \
                 'Launch reached a different app bundle: ' + executable
-        if args.peripherals or args.permissions or args.menu_appearance or args.update_fixture or args.login_item or args.agent_skill_fixture:
+        if args.video or args.peripherals or args.permissions or args.menu_appearance or args.update_fixture or args.login_item or args.agent_skill_fixture:
             gui_wait_for('gui-health', lambda tree: 'Machines' in tree)
         else:
             gui_ready('gui-health')
             assert read_state('status') == baseline, 'Opening the app changed the monitor'
         # A peer-only exercise has its own GUI health and identity checks.
         # Keep it independent of the longer layout polling/draft exercise.
-        if not (args.exercise_peer_controls or args.exercise_machine or args.exercise_machine_editor or args.idle_seconds or args.usb_route or args.exercise_kvm or args.exercise_focus or args.peripherals or args.permissions or args.exercise_arrangement or args.menu_appearance or args.update_fixture or args.login_item or args.agent_skill_fixture) or args.exercise or args.exercise_controls or args.sharing:
+        if not (args.video or args.exercise_peer_controls or args.exercise_machine or args.exercise_machine_editor or args.idle_seconds or args.usb_route or args.exercise_kvm or args.exercise_focus or args.peripherals or args.permissions or args.exercise_arrangement or args.menu_appearance or args.update_fixture or args.login_item or args.agent_skill_fixture) or args.exercise or args.exercise_controls or args.sharing:
             gui_click('Refresh monitor')
             gui_ready('gui-refresh')
             # A background status refresh must not discard a pending layout choice
@@ -3665,6 +3766,8 @@ try:
                 owned_state = run('fullscreen', baseline['source1'])['after']
     if args.permissions:
         inspect_permissions()
+    if args.video:
+        inspect_video()
     if args.menu_appearance:
         gui_inspect_menu_appearance()
     if args.update_fixture:

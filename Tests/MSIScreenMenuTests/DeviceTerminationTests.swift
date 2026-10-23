@@ -126,7 +126,7 @@ print('fixture-health predicate: separate initialization/current safety/visibili
         store.externalMutationActive = { true }; store.apply(machines: [], followUSB: false)
         XCTAssertNotNil(store.error)
         let view = MonitorView(store: store, prefs: prefs, computers: ComputersStore(preferences: prefs), updater: AppUpdater(),
-            appSettings: AppSettings(), inventory: inventory, deviceControl: control, closeControls: {})
+            appSettings: AppSettings(), inventory: inventory, deviceControl: control, videoDiagnostics: VideoDiagnosticsStore(), closeControls: {})
         XCTAssertEqual(view.selectedFooterError, store.error)
         inventory.select(nil)
         XCTAssertNil(view.selectedFooterError)

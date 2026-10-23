@@ -19,7 +19,7 @@ The [MD342CQP manual](https://download-2.msi.com/archive/mnu_exe/monitor/MD342CQ
 
 ## Install
 
-Download the **v0.3.0 universal DMG** from [Releases](https://github.com/dsebban/msi-screen-control/releases/latest). It supports Apple silicon and Intel Macs running macOS 13 or later. Open the DMG, quit any running MSI Screen, and drag **MSI Screen.app** onto **Applications**. Eject the disk, then open the installed app. For an upgrade, replace the existing copy in its current Applications folder rather than keeping duplicates.
+Download the **v0.4.0 universal DMG** from [Releases](https://github.com/dsebban/msi-screen-control/releases/latest). It supports Apple silicon and Intel Macs running macOS 13 or later. Open the DMG, quit any running MSI Screen, and drag **MSI Screen.app** onto **Applications**. Eject the disk, then open the installed app. For an upgrade, replace the existing copy in its current Applications folder rather than keeping duplicates.
 
 The app and DMG are **Developer ID signed and notarized**, with stapled Apple tickets. The universal ZIP contains the same notarized app; `SHA256SUMS` verifies the downloads. The older v0.1.0 ZIPs are ad hoc signed and not notarized.
 
@@ -44,6 +44,10 @@ export PATH="$HOME/.local/bin:$PATH"
 ```
 
 Adjust the app path if you use `~/Applications`; add the `PATH` setting to your shell configuration to keep it across sessions.
+
+`msi-screen connections` reads video and USB control independently. It can detect an MSI connected by HDMI even when the monitor's USB controller is disconnected. It reports names read from reachable computers separately from saved aliases and assignments. Missing remote observations produce useful partial JSON with exit status 1. HDMI EDID topology can suggest an input, but cannot prove the printed port label or the selected layout; those suggestions never change saved assignments or authorize a write. `msi-screen status` still requires USB control for a validated monitor layout. This backend diagnostic does not change the menu app's current presentation.
+
+**Connection** shows the current resolution/refresh rate, all modes macOS currently offers, and available OS-reported port, link-rate, driver and hot-plug observations. **Start monitoring** records changes every two seconds and on macOS display notifications; **Stop monitoring** stops sampling and keeps the session history visible. Monitoring starts paused and never changes a display or queries the monitor over USB. History is memory-only and bounded to 100 events. It cannot measure physical static, link error counters or individual training failures; a quiet history does not prove a clean signal. Available modes can change with the cable, port and current configuration and are not the panel's maximum specification. CLI `msi-screen video` reads the same snapshot without HID or SSH. Verify it with `python3 scripts/verify.py --video --binary PATH`, adding `--gui --app PATH` to exercise the actual monitoring controls.
 
 ## Menu-bar controls
 

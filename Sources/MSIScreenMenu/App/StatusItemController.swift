@@ -17,6 +17,7 @@ private final class SupportFixturePanel: NSPanel {
 final class StatusItemController: NSObject, NSApplicationDelegate {
     let appSettings = AppSettings()
     let store = MonitorStore()
+    let videoDiagnostics = VideoDiagnosticsStore()
     let inventory: DeviceInventoryStore
     let deviceControl: DeviceControlStore
     private let preferences: MonitorPreferences
@@ -253,7 +254,7 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         panel.isOpaque = false
         let hostingView = NSHostingView(rootView: MonitorView(
             store: store, prefs: preferences, computers: computers, updater: updater, appSettings: appSettings,
-            inventory: inventory, deviceControl: deviceControl,
+            inventory: inventory, deviceControl: deviceControl, videoDiagnostics: videoDiagnostics,
             closeControls: { [weak self] in self?.hideControls(reason: "close-controls-action") },
             fixtureTabObservation: fixture == nil ? nil : { [weak self] tab, reason in
                 self?.fixtureSelectedTab = tab
@@ -507,6 +508,7 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        videoDiagnostics.stop()
         inventory.stopObservingPassiveChanges()
         fixtureStopObservation?.cancel()
         fixtureStopObservation = nil

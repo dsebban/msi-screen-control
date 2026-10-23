@@ -57,6 +57,10 @@ Inspect `before`, `target`, `after`, `changes`, attempted stages and `verified`,
 
 Read `machine list`; use its real IDs and input assignments instead of inferring them from names. See [advanced controls](references/advanced-controls.md) for configuration, USB handoffs and peripheral writes.
 
+For connection troubleshooting, `connections` reads local video, USB control and configured computers independently. Preserve partial JSON and its unavailable-source errors when it exits nonzero. Observed computer names and inferred HDMI topology are distinct from saved names, cable assignments and verified OSD state; do not save assignments from an inference.
+
+`video` reads this Mac's MSI display modes, EDID and local port diagnostics without USB or SSH. It changes no display settings. In the app, open Connection, use Refresh for one sample or Start monitoring / Stop monitoring for a bounded session. Available refresh rates are macOS choices at each resolution, not panel limits. Missing samples and gaps remain explicit; no observed change does not prove signal quality or a physical picture.
+
 - `machine fullscreen ID` changes video only. `machine pbp-left ID` / `machine pbp-right ID` place a configured source on that side.
 - `machine focus ID` combines full-screen video and USB ownership for supported local USB-C / configured Linux machines. This can move the keyboard, mouse and controller away from this Mac.
 - `kvm status` reads USB ownership; `kvm layout` reads the picture through the current controller host. Use these when Linux owns the USB controller and local `status` cannot read it.

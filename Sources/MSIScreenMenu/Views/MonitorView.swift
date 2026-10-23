@@ -10,6 +10,7 @@ struct MonitorView: View {
     @ObservedObject var appSettings: AppSettings
     @ObservedObject var inventory: DeviceInventoryStore
     @ObservedObject var deviceControl: DeviceControlStore
+    @ObservedObject var videoDiagnostics: VideoDiagnosticsStore
     private var runtimeBusy: Bool { deviceControl.busy || inventory.handoffBusy || inventory.managementBusy || appSettings.hasActiveOperation }
     private var allBusy: Bool { store.hasActiveOperation || computers.busy || runtimeBusy }
     let closeControls: () -> Void
@@ -26,7 +27,7 @@ struct MonitorView: View {
     }
 
     private enum Tab: String, CaseIterable {
-        case layout = "Layout", monitor = "Monitor", devices = "Devices", machines = "Machines", peripherals = "Peripherals", settings = "Settings"
+        case layout = "Layout", monitor = "Monitor", connection = "Connection", devices = "Devices", machines = "Machines", peripherals = "Peripherals", settings = "Settings"
     }
 
     private var motion: Animation? {
@@ -48,6 +49,9 @@ struct MonitorView: View {
                         if inventory.usesBuiltInMonitor { monitorControls.disabled(runtimeBusy) }
                         else { DeviceControlSummary(inventory: inventory, control: deviceControl) }
                     case .devices: DevicesView(inventory: inventory, control: deviceControl)
+                    case .connection:
+                        if inventory.fixtureLabel != nil { Text("Local video diagnostics are not executed by this isolated fixture.") }
+                        else { VideoDiagnosticsView(diagnostics: videoDiagnostics) }
                     case .machines:
                         if inventory.fixtureLabel != nil { Text("Compiled machine/remote controls are not executed by this isolated fixture.").font(.caption) }
                         else { machineControls.disabled(runtimeBusy) }
@@ -87,6 +91,7 @@ struct MonitorView: View {
             switch selection {
             case .layout: inventory.refresh()
             case .devices: inventory.refresh()
+            case .connection: break // Its view reads only local Quartz/IOKit observations.
             case .monitor:
                 inventory.refresh()
                 if inventory.usesBuiltInMonitor { store.refreshSettings() }
@@ -192,6 +197,7 @@ struct MonitorView: View {
         switch tab {
         case .settings: appSettings.refresh()
         case .devices: break
+        case .connection: videoDiagnostics.refresh()
         case .layout: store.refreshKVM()
         case .monitor: store.refreshSettings()
         case .machines:
@@ -799,7 +805,8 @@ struct MonitorView: View {
     }
 
     var selectedFooterError: String? {
-        prefs.error ?? ((inventory.usesBuiltInMonitor || tab == .machines || tab == .peripherals) ? store.error : nil)
+        if tab == .connection { return videoDiagnostics.snapshot?.error }
+        return prefs.error ?? ((inventory.usesBuiltInMonitor || tab == .machines || tab == .peripherals) ? store.error : nil)
             ?? (tab == .machines ? computers.error : nil)
     }
 
@@ -823,7 +830,9 @@ struct MonitorView: View {
                     .accessibilityIdentifier("monitor-error")
             }
             HStack(spacing: 8) {
-                if tab == .settings {
+                if tab == .connection {
+                    Image(systemName: "waveform.path.ecg").foregroundStyle(.secondary)
+                } else if tab == .settings {
                     Image(systemName: "gearshape").foregroundStyle(.secondary)
                 } else if allBusy {
                     ProgressView().controlSize(.small)
@@ -898,6 +907,7 @@ struct MonitorView: View {
     }
 
     private var footerMessage: String {
+        if tab == .connection { return videoDiagnostics.monitoring ? "Observing local video · no monitor commands" : "Read-only local video diagnostics · monitoring paused" }
         if tab == .devices { return inventory.message }
         if !inventory.usesBuiltInMonitor && (tab == .layout || tab == .monitor) { return deviceControl.message }
         if tab == .settings { return appSettings.loginStatusText }

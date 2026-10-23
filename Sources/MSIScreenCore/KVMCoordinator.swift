@@ -121,6 +121,51 @@ public struct KVMCoordinator {
         return observation(snapshot, host: .upstream)
     }
 
+    /// Collect partial read-only state without turning a missing USB controller
+    /// into a missing video display. Only genuine local absence permits SSH.
+    public func inspectConnection() async -> MonitorControlConnection {
+        let localCheck: ConnectionEndpointObservation
+        let upstreamCheck: ConnectionEndpointObservation
+        let usb: KVMStatus
+        do {
+            if let snapshot = try await local.status(timeout: 12) {
+                localCheck = .init(.available)
+                upstreamCheck = .init(.notChecked)
+                usb = observation(snapshot, host: .local)
+            } else {
+                localCheck = .init(.absent)
+                guard let remote else {
+                    return MonitorControlConnection(local: localCheck, upstream: .init(.notChecked),
+                        upstreamMachineID: nil, usb: nil, layout: nil, layoutError: nil)
+                }
+                do {
+                    guard let snapshot = try await remote.status(timeout: 12) else {
+                        return MonitorControlConnection(local: localCheck, upstream: .init(.absent),
+                            upstreamMachineID: upstreamMachine?.id, usb: nil, layout: nil, layoutError: nil)
+                    }
+                    upstreamCheck = .init(.available)
+                    usb = observation(snapshot, host: .upstream)
+                } catch {
+                    return MonitorControlConnection(local: localCheck,
+                        upstream: .init(.unavailable, error: error.localizedDescription),
+                        upstreamMachineID: upstreamMachine?.id, usb: nil, layout: nil, layoutError: nil)
+                }
+            }
+        } catch {
+            return MonitorControlConnection(local: .init(.unavailable, error: error.localizedDescription),
+                upstream: .init(.notChecked), upstreamMachineID: upstreamMachine?.id,
+                usb: nil, layout: nil, layoutError: nil)
+        }
+        do {
+            let state = try await layout(owner: usb.controlHost)
+            return MonitorControlConnection(local: localCheck, upstream: upstreamCheck,
+                upstreamMachineID: upstreamMachine?.id, usb: usb, layout: state, layoutError: nil)
+        } catch {
+            return MonitorControlConnection(local: localCheck, upstream: upstreamCheck,
+                upstreamMachineID: upstreamMachine?.id, usb: usb, layout: nil, layoutError: error.localizedDescription)
+        }
+    }
+
     /// Read the full layout from the computer currently owning the USB hub.
     public func layout() async throws -> ScreenState {
         let current = try await status()
@@ -447,6 +492,11 @@ struct RemoteKVMEndpoint: KVMEndpoint {
     static func decode(_ output: ProcessRunner.Output, action: String) throws -> Response {
         guard !output.timedOut else { throw ScreenError.message("Linux USB request timed out") }
         guard !output.truncated else { throw ScreenError.message("Linux USB response exceeded its limit") }
+        guard [0, 2].contains(output.exitCode) else {
+            let detail = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw ScreenError.message("Linux USB SSH request failed (exit \(output.exitCode))"
+                + (detail.isEmpty ? "" : ": \(detail.prefix(1024))"))
+        }
         try rejectDuplicateKeys(output.text)
         guard let data = output.text.data(using: .utf8),
               let response = try? JSONDecoder().decode(Response.self, from: data),
