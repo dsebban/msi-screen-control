@@ -83,11 +83,14 @@ final class DeviceAdapterTests: XCTestCase {
             let expected = ["badHello": "hostWorkerBuildMismatch", "wrongRequest": "adapterProtocolMismatch", "unknownKey": "adapterProtocolMismatch",
                 "malformed": "adapterProtocolMismatch", "nonzero": "adapterExit", "noise": "adapterOutputOverflow", "hold": "adapterTimeout", "mutate": "integrityChangedDuringRun"]
             do {
-                _ = try await DeviceAdapterRunner(registry: registry, host: host).invoke(content: content, payload: .selfTest, timeout: mode == "hold" ? 0.3 : 5)
+                // The deadline includes signature checks and both process
+                // handshakes; allow startup to reach the intentional hold on CI.
+                _ = try await DeviceAdapterRunner(registry: registry, host: host).invoke(content: content, payload: .selfTest, timeout: 5)
                 XCTFail("Accepted \(mode)")
             } catch {
                 XCTAssertEqual((error as? DeviceAdapterFailure)?.code, expected[mode]); XCTAssertEqual((error as? DeviceAdapterFailure)?.cleanupConfirmed, true)
                 if mode == "badHello" { XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path)) }
+                if mode == "hold" { XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "Timeout must exercise the running adapter, not startup") }
                 print("U3 supervised failure \(mode): \(error)")
             }
             XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: registry.home.appendingPathComponent("invocations").path).isEmpty)
