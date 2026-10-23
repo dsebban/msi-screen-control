@@ -3729,7 +3729,15 @@ try:
             gui_click('Side by side')
             gui_input(0, left)
             gui_input(1, right)
-            on_state = gui_apply('gui-pbp')
+            if baseline['mode'] == 'pbp':
+                unchanged = gui_snapshot('gui-pbp-already-applied', screenshot=True)
+                assert not any(e.get('role') == 'AXButton' and e.get('label') == 'Apply layout'
+                               and e.get('enabled', True) for e in unchanged.get('elements', [])), \
+                    'Matching layout must not offer an Apply action'
+                on_state = read_state('status')
+                assert on_state == baseline, 'Selecting the current layout changed the monitor'
+            else:
+                on_state = gui_apply('gui-pbp')
             assert on_state['mode'] == 'pbp' and on_state['source1'] == left and on_state['source2'] == right
         else:
             on = run('pbp', 'on', '--left', left, '--right', right)
