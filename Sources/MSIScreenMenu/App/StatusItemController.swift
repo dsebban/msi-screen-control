@@ -472,13 +472,13 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
                 try request.validateBeforeHandling()
                 switch request.action {
                 case .status:
-                    try appControl.respond(to: request, status: wheelStatus())
+                    try appControl.respond(to: request, status: await wheelStatus())
                 case .setSideWheel:
                     let result = try await store.setSideWheel(request.preset!, expected: request.expected!)
                     try appControl.respond(to: request, result: result)
                 case .setHostAction:
                     try store.setWheelHostAction(request.hostAction!)
-                    try appControl.respond(to: request, status: wheelStatus())
+                    try appControl.respond(to: request, status: await wheelStatus())
                 case .setTopButton:
                     let result = try await store.setTopButton(
                         request.topButtonPreset!, expectedRecordHex: request.expectedRecordHex!,
@@ -493,7 +493,10 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func wheelStatus() -> RapooAppSwitchStatus {
+    private func wheelStatus() async -> RapooAppSwitchStatus {
+        // Certificate trust evaluation can block; keep the same app identity
+        // checks as the privacy card without running them on the UI thread.
+        let permissions = await Task.detached { AppPermissionStatus.current() }.value
         let controller = AppSwitchController.shared
         return RapooAppSwitchStatus(
             enabled: UserDefaults.standard.bool(forKey: MonitorStore.appSwitchPreference),
@@ -504,7 +507,7 @@ final class StatusItemController: NSObject, NSApplicationDelegate {
             pinnedBundleIdentifier: controller.pinnedApplicationBundleID,
             pinHotkeyRegistered: controller.pinActive, pinRequestCount: controller.pinRequestCount,
             lastPinnedApplication: controller.lastPinnedApplication, pinError: controller.lastPinError,
-            permissions: AppPermissionStatus.current())
+            permissions: permissions)
     }
 
     func applicationWillTerminate(_ notification: Notification) {

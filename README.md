@@ -19,7 +19,7 @@ The [MD342CQP manual](https://download-2.msi.com/archive/mnu_exe/monitor/MD342CQ
 
 ## Install
 
-Download the **v0.4.0 universal DMG** from [Releases](https://github.com/dsebban/msi-screen-control/releases/latest). It supports Apple silicon and Intel Macs running macOS 13 or later. Open the DMG, quit any running MSI Screen, and drag **MSI Screen.app** onto **Applications**. Eject the disk, then open the installed app. For an upgrade, replace the existing copy in its current Applications folder rather than keeping duplicates.
+Download the **v0.4.1 universal DMG** from [Releases](https://github.com/dsebban/msi-screen-control/releases/latest). It supports Apple silicon and Intel Macs running macOS 13 or later. Open the DMG, quit any running MSI Screen, and drag **MSI Screen.app** onto **Applications**. Eject the disk, then open the installed app. For an upgrade, replace the existing copy in its current Applications folder rather than keeping duplicates.
 
 The app and DMG are **Developer ID signed and notarized**, with stapled Apple tickets. The universal ZIP contains the same notarized app; `SHA256SUMS` verifies the downloads. The older v0.1.0 ZIPs are ad hoc signed and not notarized.
 
